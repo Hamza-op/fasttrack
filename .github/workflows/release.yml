@@ -2,31 +2,45 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rolling-release-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    name: Build & Release
+    name: Build And Publish EXE
     runs-on: windows-latest
-    
+
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Rust Cache
+      - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Release
+      - name: Build release
         run: cargo build --release
 
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
+      - name: Publish rolling GitHub release
+        uses: softprops/action-gh-release@v2
         with:
+          tag_name: auto-release
+          name: Latest Build
+          body: |
+            Automated build from `${{ github.sha }}`.
+            Branch: `${{ github.ref_name }}`
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
           files: target/release/fasttrack.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

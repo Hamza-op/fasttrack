@@ -41,10 +41,13 @@ The release executable will be located at `target\release\fasttrack.exe`.
 
 ## 🤖 Automated Releases
 
-This project uses GitHub Actions to automate releases. To trigger a new release:
-1. Tag your commit: `git tag v1.0.0`
-2. Push the tag: `git push origin v1.0.0`
-3. GitHub will automatically build and upload the `fasttrack.exe` to a new Release.
+This project uses GitHub Actions to publish a rolling GitHub prerelease whenever you push to `main` or `master`.
+
+1. Push your commit: `git push origin main`
+2. GitHub Actions builds the app on Windows
+3. The latest `fasttrack.exe` is uploaded to the `auto-release` prerelease
+
+If you want versioned releases later, keep this workflow for continuous builds and add a second tag-based release workflow.
 
 ---
 *Developed by Hamza-op*
