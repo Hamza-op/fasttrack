@@ -1,0 +1,59 @@
+[package]
+name = "fasttrack"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+description = "Professional media ingest and protection tool for Windows."
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0"
+fs4 = "0.9"
+kamadak-exif = "0.6"
+rfd = "0.15"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+slint = { version = "1.8", default-features = true, features = ["backend-winit", "renderer-femtovg", "std"] }
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.8", features = ["serde", "v4"] }
+walkdir = "2.5"
+whoami = "1.5"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+slint-build = "1.8"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+tempfile = "3.15"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[package.metadata.winresource]
+OriginalFilename = "FastTrack.exe"
+ProductName = "FastTrack"
+FileDescription = "Professional Media Ingest & Protection Tool"
+LegalCopyright = "© 2026"

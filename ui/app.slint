@@ -1,0 +1,592 @@
+import { ComboBox } from "std-widgets.slint";
+
+component UiProgressBar inherits Rectangle {
+    in property <float> value: 0.0;
+    in property <color> bar-color: #3b82f6;
+    in property <string> label: "";
+
+    height: 26px;
+
+    VerticalLayout {
+        spacing: 2px;
+        HorizontalLayout {
+            Text {
+                text: root.label;
+                color: #94a3b8;
+                font-size: 9px;
+                font-weight: 800;
+                vertical-alignment: center;
+                letter-spacing: 1px;
+            }
+
+            Text {
+                text: root.value >= 0.005 ? Math.round(root.value * 100) + "%" : "";
+                color: root.bar-color;
+                font-size: 10px;
+                font-weight: 800;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle {
+            height: 8px;
+            border-radius: 4px;
+            background: #1e293b;
+            border-width: 1px;
+            border-color: #334155;
+
+            Rectangle {
+                x: 0;
+                y: 0;
+                height: parent.height;
+                border-radius: parent.border-radius;
+                width: parent.width * clamp(root.value, 0, 1);
+                background: @linear-gradient(90deg, root.bar-color.darker(0.1), root.bar-color.brighter(0.2));
+                animate width { duration: 300ms; easing: ease-out; }
+
+                Rectangle {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height * 0.4;
+                    border-radius: 4px;
+                    background: #ffffff11;
+                }
+            }
+        }
+    }
+}
+
+component UiPill inherits Rectangle {
+    in property <string> label;
+    in property <bool> accent: false;
+    in property <bool> good: false;
+    in property <bool> pulse: false;
+
+    height: 20px;
+    border-radius: 10px;
+    background: good ? #064e3b : accent ? #1e3a8a : #334155;
+    border-width: 1px;
+    border-color: good ? #10b981 : accent ? #3b82f6 : #475569;
+
+    Text {
+        x: 8px;
+        width: parent.width - 16px;
+        height: parent.height;
+        text: root.label;
+        color: good ? #34d399 : accent ? #93c5fd : #cbd5e1;
+        font-size: 9px;
+        font-weight: 800;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        letter-spacing: 0.5px;
+    }
+}
+
+component UiButton inherits Rectangle {
+    in property <string> label;
+    in property <string> icon: "";
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    callback clicked();
+
+    border-radius: 6px;
+    background: danger
+        ? (ta.pressed ? #991b1b : ta.has-hover ? #dc2626 : #ef4444)
+        : primary
+            ? (ta.pressed ? #1e40af : ta.has-hover ? #2563eb : #3b82f6)
+            : (ta.pressed ? #1e293b : ta.has-hover ? #334155 : #1e293b);
+    border-width: 1px;
+    border-color: danger ? #ef444444 : primary ? #3b82f644 : (ta.has-hover ? #475569 : #334155);
+    drop-shadow-blur: ta.has-hover ? 8px : 0px;
+    drop-shadow-color: danger ? #ef444422 : primary ? #3b82f622 : #00000033;
+
+    animate background { duration: 120ms; easing: ease-out; }
+    animate border-color { duration: 120ms; }
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 4px;
+        padding-left: 8px;
+        padding-right: 8px;
+
+        Text {
+            text: root.icon;
+            color: #ffffff;
+            font-size: 10px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            visible: root.icon != "";
+        }
+
+        Text {
+            text: root.label;
+            color: #ffffff;
+            font-size: 11px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+component UiFileButton inherits Rectangle {
+    callback clicked();
+
+    width: 30px;
+    height: 30px;
+    border-radius: 6px;
+    background: ta.pressed ? #1e293b : ta.has-hover ? #334155 : #1e293b;
+    border-width: 1px;
+    border-color: ta.has-hover ? #475569 : #334155;
+
+    animate background { duration: 120ms; }
+    animate border-color { duration: 120ms; }
+
+    Text {
+        text: "📂";
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+component UiInput inherits Rectangle {
+    in-out property <string> value;
+    in property <string> placeholder;
+    callback edited(string);
+
+    height: 30px;
+    border-radius: 6px;
+    background: #0f172a;
+    border-width: 1px;
+    border-color: input.has-focus ? #3b82f6 : #334155;
+    drop-shadow-blur: input.has-focus ? 6px : 0px;
+    drop-shadow-color: #3b82f622;
+
+    animate border-color { duration: 150ms; }
+    animate drop-shadow-blur { duration: 200ms; }
+
+    input := TextInput {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text <=> root.value;
+        color: #f8fafc;
+        font-size: 12px;
+        vertical-alignment: center;
+        edited => { root.edited(input.text); }
+    }
+
+    Text {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text: root.placeholder;
+        color: #64748b;
+        font-size: 12px;
+        font-italic: true;
+        vertical-alignment: center;
+        visible: root.value == "" && !input.has-focus;
+    }
+}
+
+component UiCard inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle: "";
+    in property <string> icon: "";
+    in property <color> accent-color: #3b82f6;
+
+    border-radius: 10px;
+    background: #1e293b;
+    border-width: 1px;
+    border-color: #334155;
+    drop-shadow-blur: 20px;
+    drop-shadow-color: #00000044;
+    drop-shadow-offset-y: 4px;
+    clip: true;
+
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 3px;
+        background: @linear-gradient(90deg, root.accent-color, root.accent-color.brighter(0.4));
+    }
+
+    Rectangle {
+        x: 0;
+        y: 3px;
+        width: parent.width;
+        height: 36px;
+        background: transparent;
+
+        HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            spacing: 8px;
+            alignment: start;
+
+            Text {
+                text: root.icon;
+                font-size: 14px;
+                vertical-alignment: center;
+                visible: root.icon != "";
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+
+                Text {
+                    text: root.title;
+                    font-size: 12px;
+                    font-weight: 800;
+                    color: #f8fafc;
+                    letter-spacing: 0.3px;
+                }
+
+                Text {
+                    text: root.subtitle;
+                    font-size: 9px;
+                    color: #64748b;
+                    visible: root.subtitle != "";
+                }
+            }
+        }
+    }
+}
+
+component UiFormLabel inherits Text {
+    in property <string> label;
+    text: root.label;
+    color: #94a3b8;
+    font-size: 11px;
+    font-weight: 700;
+    vertical-alignment: center;
+    letter-spacing: 0.2px;
+}
+
+// ─── Main Window ─────────────────────────────────────────────────────────────
+export component AppWindow inherits Window {
+    width: 680px;
+    height: 580px;
+    title: "FastTrack";
+    background: #0f172a;
+    default-font-family: "SF Pro Text";
+
+    in-out property <string> status_text: "Ready";
+    in-out property <string> drives_text: "";
+    in-out property <string> source_drive: "";
+    in-out property <string> client_name: "";
+    in-out property <string> event_name: "";
+    in-out property <string> camera_label: "";
+    in-out property <string> base_path: "";
+    in-out property <string> report_text: "";
+    in-out property <[string]> event_menu: [];
+    in-out property <int> event_menu_index: -1;
+    in-out property <float> progress_percent: 0.0;
+    in-out property <float> verify_percent: 0.0;
+    in-out property <string> progress_label: "";
+
+    callback refresh_cards();
+    callback scan_card();
+    callback start_ingest();
+    callback cancel_ingest();
+    callback show_history();
+    callback suggest_client();
+    callback select_source_path();
+    callback client_name_edited(string);
+    callback event_name_edited(string);
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        // ── USER PROFILE ──
+        HorizontalLayout {
+            padding-bottom: 2px;
+            alignment: space-between;
+            
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                
+                Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 12px;
+                    background: #334155;
+                    border-width: 1px;
+                    border-color: #3b82f644;
+                    clip: true;
+                    
+                    Text {
+                        text: "👤";
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 0px;
+                    
+                    Text {
+                        text: "Hamza-op";
+                        color: #f8fafc;
+                        font-size: 11px;
+                        font-weight: 800;
+                    }
+                    Text {
+                        text: "mynumber786786@gmail.com";
+                        color: #64748b;
+                        font-size: 9px;
+                        font-weight: 500;
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 70px;
+                height: 18px;
+                border-radius: 9px;
+                background: #1e293b;
+                border-width: 1px;
+                border-color: #334155;
+                y: 3px;
+                
+                Text {
+                    text: "GIT PROFILE";
+                    color: #94a3b8;
+                    font-size: 8px;
+                    font-weight: 900;
+                    letter-spacing: 0.5px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // ── CARD 1 — Detected Cards ──
+        UiCard {
+            height: 88px;
+            title: "Detected Cards";
+            subtitle: "Auto-scanning media";
+            icon: "💾";
+            accent-color: #3b82f6;
+
+            UiPill {
+                x: parent.width - 80px;
+                y: 10px;
+                width: 66px;
+                label: "⚡ AUTO";
+                accent: true;
+            }
+
+            VerticalLayout {
+                y: 40px;
+                padding-left: 14px;
+                padding-right: 14px;
+                spacing: 5px;
+
+                HorizontalLayout {
+                    spacing: 5px;
+                    alignment: start;
+
+                    UiButton { height: 28px; label: "Refresh"; icon: "🔄"; clicked => { refresh_cards(); } }
+                    UiButton { height: 28px; label: "Scan"; icon: "🔍"; clicked => { scan_card(); } }
+
+                    Rectangle { width: 1px; height: 20px; background: #334155; }
+
+                    UiButton { height: 28px; label: "Ingest"; icon: "🚀"; primary: true; clicked => { start_ingest(); } }
+                    UiButton { height: 28px; label: "Stop"; icon: "⏹"; danger: true; clicked => { cancel_ingest(); } }
+
+                    Rectangle { width: 1px; height: 20px; background: #334155; }
+
+                    UiButton { height: 28px; label: "History"; icon: "📋"; clicked => { show_history(); } }
+                }
+
+                Text {
+                    text: drives_text == "" ? "No cards detected. Plug in media to begin." : drives_text;
+                    color: drives_text == "" ? #475569 : #3b82f6;
+                    font-size: 10px;
+                    font-weight: 600;
+                }
+            }
+        }
+
+        // ── CARD 2 — Session Configuration ──
+        UiCard {
+            height: 190px;
+            title: "Session";
+            subtitle: "Source, client & destination";
+            icon: "⚙️";
+            accent-color: #8b5cf6;
+
+            VerticalLayout {
+                padding-top: 40px;
+                padding-left: 14px;
+                padding-right: 14px;
+                padding-bottom: 8px;
+                spacing: 6px;
+
+                // Source
+                HorizontalLayout {
+                    spacing: 6px;
+                    UiFormLabel { width: 52px; height: 30px; label: "Source"; }
+                    UiInput {
+                        value <=> source_drive;
+                        placeholder: "E:\\ or /Volumes/MEDIA";
+                    }
+                    UiFileButton { clicked => { select_source_path(); } }
+                }
+
+                // Client
+                HorizontalLayout {
+                    spacing: 6px;
+                    UiFormLabel { width: 52px; height: 30px; label: "Client"; }
+                    UiInput {
+                        value <=> client_name;
+                        placeholder: "Client Name";
+                        edited(value) => { client_name_edited(value); }
+                    }
+                    UiButton {
+                        width: 80px;
+                        height: 30px;
+                        label: "Search";
+                        icon: "🔍";
+                        clicked => { suggest_client(); }
+                    }
+                }
+
+                // Event
+                HorizontalLayout {
+                    spacing: 6px;
+                    UiFormLabel { width: 52px; height: 30px; label: "Event"; }
+                    UiInput {
+                        value <=> event_name;
+                        placeholder: "Wedding / Session";
+                        edited(value) => { event_name_edited(value); }
+                    }
+                    ComboBox {
+                        width: 130px;
+                        height: 30px;
+                        model: root.event_menu;
+                        current-index <=> root.event_menu_index;
+                        selected(value) => { root.event_name = value; event_name_edited(value); }
+                    }
+                }
+
+                // Dest
+                HorizontalLayout {
+                    spacing: 6px;
+                    UiFormLabel { width: 52px; height: 30px; label: "Dest"; }
+                    UiInput {
+                        value <=> base_path;
+                        placeholder: "D:\\Photos or storage path";
+                    }
+                }
+            }
+        }
+
+        // ── CARD 3 — Live Status ──
+        UiCard {
+            title: "Live Status";
+            icon: "⚡";
+            accent-color: #22c55e;
+
+            UiPill {
+                x: parent.width - 72px;
+                y: 10px;
+                width: 58px;
+                label: "● LIVE";
+                good: true;
+                pulse: true;
+            }
+
+            VerticalLayout {
+                padding-top: 40px;
+                padding-left: 14px;
+                padding-right: 14px;
+                padding-bottom: 10px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text {
+                            text: status_text;
+                            color: #f8fafc;
+                            font-size: 12px;
+                            font-weight: 800;
+                        }
+                        Text {
+                            text: progress_label;
+                            color: #64748b;
+                            font-size: 10px;
+                            font-weight: 600;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    UiProgressBar {
+                        value: progress_percent;
+                        bar-color: #3b82f6;
+                        label: "COPY";
+                    }
+                    UiProgressBar {
+                        value: verify_percent;
+                        bar-color: #22c55e;
+                        label: "VERIFY";
+                    }
+                }
+
+                Rectangle { height: 1px; background: #334155; }
+
+                VerticalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: "INGEST LOG";
+                        font-size: 9px;
+                        font-weight: 800;
+                        color: #64748b;
+                        letter-spacing: 1px;
+                    }
+
+                    Rectangle {
+                        border-radius: 6px;
+                        background: #0f172a;
+                        border-width: 1px;
+                        border-color: #334155;
+                        clip: true;
+
+                        Flickable {
+                            viewport-height: max(self.height, report-content.preferred-height + 16px);
+
+                            report-content := Text {
+                                x: 8px;
+                                y: 8px;
+                                width: parent.width - 16px;
+                                text: report_text == "" ? "System idle. Waiting for ingest..." : report_text;
+                                color: report_text == "" ? #475569 : #94a3b8;
+                                wrap: word-wrap;
+                                font-size: 11px;
+                                font-family: "Consolas";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

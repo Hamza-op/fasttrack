@@ -1,0 +1,30 @@
+# Rust build output
+/target/
+/.codex-target/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Local temp/log artifacts
+*.log
+*.tmp
+*.temp
+
+# SQLite/runtime artifacts (if created in workspace)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# GitHub Actions
+!.github/workflows/
