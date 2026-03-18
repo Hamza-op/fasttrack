@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
@@ -12,23 +13,26 @@ use chrono::Utc;
 use fs4::available_space;
 use serde::{Deserialize, Serialize};
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{info, warn};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::app::db::Database;
 use crate::app::errors::MoonError;
-use crate::app::lock::{apply_readonly_recursive, hide_manifest};
+use crate::app::lock::{
+    apply_readonly_recursive, hide_manifest, mark_folder_system, protect_folder_from_delete,
+};
 use crate::app::manifest::{write_manifest, Manifest};
 use crate::app::settings::{AppPaths, Settings};
 use crate::app::types::{
     enforce_path_limit, validate_folder_name, EventStatus, FileStatus, FinalReport, IngestProgress,
-    MediaType, PreflightResult, ScannedFile, SessionRequest, StoredFileRecord,
+    LockMode, MediaType, PreflightResult, ScannedFile, SessionRequest, StoredFileRecord,
 };
 
 const MIN_COPY_BUFFER_BYTES: usize = 256 * 1024;
 const PROGRESS_EMIT_MIN_BYTES: u64 = 8 * 1024 * 1024;
 const PROGRESS_EMIT_MIN_INTERVAL_MS: u128 = 180;
+const DUPLICATE_HASH_WINDOW_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone)]
 pub struct IngestEngine {
@@ -39,7 +43,11 @@ pub struct IngestEngine {
 
 impl IngestEngine {
     pub fn new(db: Database, settings: Settings, paths: AppPaths) -> Self {
-        Self { db, settings, paths }
+        Self {
+            db,
+            settings,
+            paths,
+        }
     }
 
     pub async fn run_session<F>(
@@ -57,12 +65,14 @@ impl IngestEngine {
         let split_photo_folders = self.should_split_photo_folders(&request);
         let preflight = self.preflight(&request, camera_folder.as_deref(), split_photo_folders)?;
         let _session_lock = self.acquire_session_lock(&request, &preflight.destination_root)?;
-        let client_id = self.db.upsert_client(&request.client_name, &request.base_path, None)?;
+        let client_id = self
+            .db
+            .upsert_client(&request.client_name, &request.base_path, None)?;
         self.db.remember_custom_event(&request.event_name)?;
 
-        let event_id = self
-            .db
-            .prepare_event(client_id, &request.event_name, &preflight.destination_root)?;
+        let event_id =
+            self.db
+                .prepare_event(client_id, &request.event_name, &preflight.destination_root)?;
         let existing = self.db.load_event_files(event_id)?;
 
         let total_bytes = request.scan.total_size_bytes;
@@ -70,6 +80,7 @@ impl IngestEngine {
         let mut bytes_done = 0u64;
         let mut verified_files = 0usize;
         let mut failed_files = 0usize;
+        let mut skipped_files = 0usize;
         let mut warnings = preflight.warnings;
         if !existing.is_empty() {
             warnings.push(format!(
@@ -94,6 +105,7 @@ impl IngestEngine {
                     &preflight.destination_root,
                     verified_files,
                     failed_files,
+                    total_files,
                     total_bytes,
                     false,
                 )?;
@@ -111,7 +123,8 @@ impl IngestEngine {
                 camera_folder.as_deref(),
                 split_photo_folders,
             )?;
-            self.db.ensure_file_row(event_id, file, &destination, FileStatus::Pending)?;
+            self.db
+                .ensure_file_row(event_id, file, &destination, FileStatus::Pending)?;
 
             if let Some(record) = existing.get(&file.source_path) {
                 if matches!(record.status, FileStatus::Verified) && record.dest_path.exists() {
@@ -119,7 +132,7 @@ impl IngestEngine {
                     bytes_done += file.size_bytes;
                     on_progress(IngestProgress {
                         message: format!("Skipping already verified {}", file.filename),
-                        files_done: verified_files + failed_files,
+                        files_done: verified_files + failed_files + skipped_files,
                         total_files,
                         bytes_done,
                         total_bytes,
@@ -128,10 +141,74 @@ impl IngestEngine {
                 }
             }
 
-            if let Some(duplicate) = self.db.find_duplicate_for_client(&request.client_name, file)? {
-                if matches!(duplicate.status, FileStatus::Verified)
-                    && duplicate.event_name.eq_ignore_ascii_case(&request.event_name)
-                {
+            let duplicate_candidates = self
+                .db
+                .find_duplicate_candidates_for_client(&request.client_name, file)?;
+            if !duplicate_candidates.is_empty() {
+                let mut source_edge_hash: Option<String> = None;
+                let mut matched_duplicate: Option<crate::app::types::DuplicateRecord> = None;
+
+                for duplicate in duplicate_candidates {
+                    let same_event = duplicate
+                        .event_name
+                        .eq_ignore_ascii_case(&request.event_name);
+                    if !same_event && !request.skip_already_copied {
+                        continue;
+                    }
+                    if !matches!(duplicate.status, FileStatus::Verified) {
+                        continue;
+                    }
+                    if !duplicate.dest_path.exists() {
+                        warnings.push(format!(
+                            "Duplicate record for {} ignored because destination file is missing.",
+                            file.filename
+                        ));
+                        continue;
+                    }
+
+                    let source_hash = match &source_edge_hash {
+                        Some(hash) => hash.clone(),
+                        None => match hash_file_partial(&file.source_path).await {
+                            Ok(hash) => {
+                                source_edge_hash = Some(hash.clone());
+                                hash
+                            }
+                            Err(error) => {
+                                warn!(
+                                    "duplicate source hash failed for {}: {error:#}",
+                                    file.source_path.display()
+                                );
+                                warnings.push(format!(
+                                    "Could not confirm duplicate for {} because source file could not be read: {}",
+                                    file.filename, error
+                                ));
+                                continue;
+                            }
+                        },
+                    };
+                    let duplicate_hash = match hash_file_partial(&duplicate.dest_path).await {
+                        Ok(hash) => hash,
+                        Err(error) => {
+                            warn!(
+                                "duplicate destination hash failed for {}: {error:#}",
+                                duplicate.dest_path.display()
+                            );
+                            warnings.push(format!(
+                                "Duplicate record for {} ignored because previous copy could not be read at {}: {}",
+                                file.filename,
+                                duplicate.dest_path.display(),
+                                error
+                            ));
+                            continue;
+                        }
+                    };
+                    if source_hash == duplicate_hash {
+                        matched_duplicate = Some(duplicate);
+                        break;
+                    }
+                }
+
+                if let Some(duplicate) = matched_duplicate {
                     self.db.update_file_status(
                         event_id,
                         &file.source_path,
@@ -142,6 +219,14 @@ impl IngestEngine {
                     )?;
                     warnings.push(format!("Skipped duplicate {}", file.filename));
                     bytes_done += file.size_bytes;
+                    skipped_files += 1;
+                    on_progress(IngestProgress {
+                        message: format!("Skipping duplicate {}", file.filename),
+                        files_done: verified_files + failed_files + skipped_files,
+                        total_files,
+                        bytes_done,
+                        total_bytes,
+                    });
                     continue;
                 }
             }
@@ -157,7 +242,7 @@ impl IngestEngine {
 
             on_progress(IngestProgress {
                 message: format!("Copying {}", file.filename),
-                files_done: verified_files + failed_files,
+                files_done: verified_files + failed_files + skipped_files,
                 total_files,
                 bytes_done,
                 total_bytes,
@@ -180,7 +265,7 @@ impl IngestEngine {
                             file.filename,
                             crate::app::types::format_bytes(file_done)
                         ),
-                        files_done: verified_files + failed_files,
+                        files_done: verified_files + failed_files + skipped_files,
                         total_files,
                         bytes_done: bytes_done + file_done,
                         total_bytes,
@@ -222,6 +307,7 @@ impl IngestEngine {
                             &preflight.destination_root,
                             verified_files,
                             failed_files,
+                            total_files,
                             total_bytes,
                             false,
                         )?;
@@ -247,15 +333,18 @@ impl IngestEngine {
         }
 
         let mut locked = false;
-        if failed_files == 0 {
-            let lock_errors = apply_readonly_recursive(&preflight.destination_root);
-            locked = lock_errors.is_empty();
-            for (path, error) in lock_errors {
-                warnings.push(format!("Could not lock {}: {}", path.display(), error));
+        if failed_files == 0 && self.settings.safety.auto_lock_on_complete {
+            match self.settings.safety.lock_mode {
+                LockMode::None => {}
+                LockMode::Attribute | LockMode::Acl => {
+                    locked = apply_event_lock(&preflight.destination_root, &mut warnings);
+                }
             }
         }
 
-        let manifest_records = self.db.manifest_records(event_id, &preflight.destination_root)?;
+        let manifest_records = self
+            .db
+            .manifest_records(event_id, &preflight.destination_root)?;
         let manifest = Manifest::from_records(
             &request.client_name,
             &request.event_name,
@@ -283,6 +372,7 @@ impl IngestEngine {
             &preflight.destination_root,
             verified_files,
             failed_files,
+            total_files,
             total_bytes,
             locked,
         )?;
@@ -379,7 +469,28 @@ impl IngestEngine {
             enforce_path_limit(&planned)?;
         }
 
-        let warnings = vec!["Event folder will be set to read-only after verification.".into()];
+        let mut warnings = Vec::new();
+        if self.settings.safety.auto_lock_on_complete {
+            match self.settings.safety.lock_mode {
+                LockMode::None => warnings.push(
+                    "Auto-lock is enabled but lock mode is set to none; destination will remain writable."
+                        .to_string(),
+                ),
+                LockMode::Attribute | LockMode::Acl => warnings.push(
+                    "Event folder will be locked after verification and warn on delete.".into(),
+                ),
+            }
+        } else {
+            warnings.push(
+                "Auto-lock is disabled; destination will remain writable after ingest.".into(),
+            );
+        }
+        if request.skip_already_copied {
+            warnings.push(
+                "Previously copied files for this client will be skipped when matches are found."
+                    .into(),
+            );
+        }
 
         Ok(PreflightResult {
             destination_root,
@@ -491,6 +602,34 @@ impl IngestEngine {
     }
 }
 
+fn apply_event_lock(destination_root: &Path, warnings: &mut Vec<String>) -> bool {
+    let lock_errors = apply_readonly_recursive(destination_root);
+    let mut locked = lock_errors.is_empty();
+
+    for (path, error) in lock_errors {
+        warnings.push(format!("Could not lock {}: {}", path.display(), error));
+    }
+
+    if let Err(error) = protect_folder_from_delete(destination_root) {
+        warnings.push(format!(
+            "Could not protect {} from delete operations: {}",
+            destination_root.display(),
+            error
+        ));
+        locked = false;
+    }
+
+    if let Err(error) = mark_folder_system(destination_root) {
+        warnings.push(format!(
+            "Could not mark lock warning on {}: {}",
+            destination_root.display(),
+            error
+        ));
+    }
+
+    locked
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionLock {
     pid: u32,
@@ -507,11 +646,22 @@ fn process_is_running(pid: u32) -> bool {
     #[cfg(windows)]
     {
         let output = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}")])
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
             .output();
         if let Ok(output) = output {
             let text = String::from_utf8_lossy(&output.stdout);
-            return text.contains(&pid.to_string());
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with("INFO:") {
+                    continue;
+                }
+                let mut fields = line.trim_matches('"').split("\",\"");
+                let _image_name = fields.next();
+                let pid_field = fields.next().unwrap_or_default();
+                if pid_field.parse::<u32>().ok() == Some(pid) {
+                    return true;
+                }
+            }
         }
         false
     }
@@ -531,7 +681,6 @@ impl Drop for SessionLockGuard {
     }
 }
 
-
 fn unique_destination(path: PathBuf) -> PathBuf {
     if !path.exists() {
         return path;
@@ -542,7 +691,10 @@ fn unique_destination(path: PathBuf) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("file");
-    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
 
     for index in 1..1000 {
         let candidate = if extension.is_empty() {
@@ -589,18 +741,20 @@ where
             let _ = fs::remove_file(destination).await;
         }
 
-        let mut source = File::open(&file.source_path)
-            .await
-            .map_err(|source| MoonError::SourceReadError {
-                path: file.source_path.clone(),
-                source,
-            })?;
-        let mut dest = File::create(destination)
-            .await
-            .map_err(|source| MoonError::DestWriteError {
-                path: destination.to_path_buf(),
-                source,
-            })?;
+        let mut source =
+            File::open(&file.source_path)
+                .await
+                .map_err(|source| MoonError::SourceReadError {
+                    path: file.source_path.clone(),
+                    source,
+                })?;
+        let mut dest =
+            File::create(destination)
+                .await
+                .map_err(|source| MoonError::DestWriteError {
+                    path: destination.to_path_buf(),
+                    source,
+                })?;
 
         let mut hasher = Xxh3::new();
         let mut total = 0u64;
@@ -609,15 +763,20 @@ where
 
         loop {
             if cancel_flag.load(Ordering::Relaxed) {
-                return Err(MoonError::Cancelled { copied: 0, total: 0 }.into());
+                return Err(MoonError::Cancelled {
+                    copied: 0,
+                    total: 0,
+                }
+                .into());
             }
-            let read = source
-                .read(&mut buffer)
-                .await
-                .map_err(|source| MoonError::SourceReadError {
-                    path: file.source_path.clone(),
-                    source,
-                })?;
+            let read =
+                source
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|source| MoonError::SourceReadError {
+                        path: file.source_path.clone(),
+                        source,
+                    })?;
             if read == 0 {
                 break;
             }
@@ -682,6 +841,36 @@ async fn hash_file(path: &Path, buffer_size: usize) -> Result<String> {
     Ok(format!("{:032x}", hasher.digest128()))
 }
 
+async fn hash_file_partial(path: &Path) -> Result<String> {
+    let mut file = File::open(path).await?;
+    let file_len = file.metadata().await?.len();
+    let mut hasher = Xxh3::new();
+    hasher.update(&file_len.to_le_bytes());
+
+    if file_len <= DUPLICATE_HASH_WINDOW_BYTES * 2 {
+        let mut buffer = vec![0u8; file_len as usize];
+        if !buffer.is_empty() {
+            file.read_exact(&mut buffer).await?;
+            hasher.update(&buffer);
+        }
+        return Ok(format!("{:032x}", hasher.digest128()));
+    }
+
+    let mut head = vec![0u8; DUPLICATE_HASH_WINDOW_BYTES as usize];
+    file.read_exact(&mut head).await?;
+    hasher.update(&head);
+
+    file.seek(SeekFrom::Start(
+        file_len.saturating_sub(DUPLICATE_HASH_WINDOW_BYTES),
+    ))
+    .await?;
+    let mut tail = vec![0u8; DUPLICATE_HASH_WINDOW_BYTES as usize];
+    file.read_exact(&mut tail).await?;
+    hasher.update(&tail);
+
+    Ok(format!("{:032x}", hasher.digest128()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -728,7 +917,9 @@ mod tests {
             source_path: path.to_path_buf(),
             relative_source_path: PathBuf::from(&filename),
             filename,
-            size_bytes: fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
+            size_bytes: fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
             source_modified: "2026-01-01T00:00:00Z".into(),
             source_created: "2026-01-01T00:00:00Z".into(),
             media_type,
@@ -744,8 +935,16 @@ mod tests {
         let base = temp.path().join("dest");
         fs::create_dir_all(source.join("DCIM").join("100MSDCF")).expect("create source");
         fs::create_dir_all(&base).expect("create base");
-        fs::write(source.join("DCIM").join("100MSDCF").join("A001.ARW"), b"rawdata").expect("write raw");
-        fs::write(source.join("DCIM").join("100MSDCF").join("A001.JPG"), b"jpgdata").expect("write jpg");
+        fs::write(
+            source.join("DCIM").join("100MSDCF").join("A001.ARW"),
+            b"rawdata",
+        )
+        .expect("write raw");
+        fs::write(
+            source.join("DCIM").join("100MSDCF").join("A001.JPG"),
+            b"jpgdata",
+        )
+        .expect("write jpg");
 
         let summary = scan_drive(&source, false, false).expect("scan");
         let paths = test_paths(temp.path());
@@ -759,17 +958,25 @@ mod tests {
             client_name: "Client One".into(),
             event_name: "Barat".into(),
             camera_label_override: Some("Cam A".into()),
+            skip_already_copied: false,
             base_path: base.clone(),
             scan: summary.clone(),
         };
 
-        let runtime = Builder::new_current_thread().enable_all().build().expect("runtime");
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
         let report = runtime
             .block_on(engine.run_session(request, Arc::new(AtomicBool::new(false)), |_| {}))
             .expect("run session");
 
         assert_eq!(report.failed_files, 0);
         assert_eq!(report.verified_files, summary.total_files);
+        assert!(
+            !report.locked,
+            "auto-lock disabled should keep destination writable"
+        );
         let manifest_path = base
             .join("Client One")
             .join("Barat")
@@ -827,16 +1034,18 @@ mod tests {
         let event_id = db
             .prepare_event(client_id, "Mehndi", &event_root)
             .expect("prepare event");
-        let existing_dest = event_root
-            .join("Photos")
-            .join("Cam A")
-            .join("A001.ARW");
+        let existing_dest = event_root.join("Photos").join("Cam A").join("A001.ARW");
         if let Some(parent) = existing_dest.parent() {
             fs::create_dir_all(parent).expect("create existing parent");
         }
         fs::write(&existing_dest, b"raw-1").expect("existing destination");
-        db.ensure_file_row(event_id, &file_one, &existing_dest, crate::app::types::FileStatus::Pending)
-            .expect("seed file row");
+        db.ensure_file_row(
+            event_id,
+            &file_one,
+            &existing_dest,
+            crate::app::types::FileStatus::Pending,
+        )
+        .expect("seed file row");
         db.update_file_status(
             event_id,
             &file_one.source_path,
@@ -852,6 +1061,7 @@ mod tests {
             &event_root,
             1,
             0,
+            summary.total_files,
             summary.total_size_bytes,
             false,
         )
@@ -862,23 +1072,450 @@ mod tests {
             client_name: "Client Two".into(),
             event_name: "Mehndi".into(),
             camera_label_override: Some("Cam A".into()),
+            skip_already_copied: false,
             base_path: base.clone(),
             scan: summary,
         };
 
-        let runtime = Builder::new_current_thread().enable_all().build().expect("runtime");
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
         let report = runtime
             .block_on(engine.run_session(request, Arc::new(AtomicBool::new(false)), |_| {}))
             .expect("resume run session");
 
         assert_eq!(report.failed_files, 0);
         assert_eq!(report.verified_files, 2);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Resuming existing ingest")));
+    }
+
+    #[test]
+    fn duplicate_record_with_missing_destination_is_not_skipped() {
+        let temp = tempdir().expect("temp dir");
+        let source = temp.path().join("card");
+        let base = temp.path().join("dest");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&base).expect("create base");
+        let src = source.join("A001.ARW");
+        fs::write(&src, b"rawdata").expect("write source file");
+
+        let file = make_scanned_file(&src, MediaType::PhotoRaw);
+        let summary = ScanSummary {
+            manufacturer: "Sony".into(),
+            drive_root: source.clone(),
+            card_label: Some(source.display().to_string()),
+            total_size_bytes: file.size_bytes,
+            total_files: 1,
+            raw_count: 1,
+            jpg_count: 0,
+            video_count: 0,
+            audio_count: 0,
+            skipped_count: 0,
+            files: vec![file.clone()],
+        };
+
+        let paths = test_paths(temp.path());
+        paths.ensure().expect("ensure paths");
+        let db = Database::open(&paths).expect("db open");
+        let settings = make_settings(&base);
+        let engine = IngestEngine::new(db.clone(), settings, paths);
+
+        let client_id = db
+            .upsert_client("Client Five", &base, None)
+            .expect("upsert client");
+        let existing_event_root = base.join("Client Five").join("Barat");
+        let existing_event_id = db
+            .prepare_event(client_id, "Barat", &existing_event_root)
+            .expect("prepare event");
+        let missing_dest = existing_event_root.join("Photos").join("A001.ARW");
+        db.ensure_file_row(
+            existing_event_id,
+            &file,
+            &missing_dest,
+            crate::app::types::FileStatus::Pending,
+        )
+        .expect("seed duplicate file row");
+        db.update_file_status(
+            existing_event_id,
+            &file.source_path,
+            &missing_dest,
+            crate::app::types::FileStatus::Verified,
+            Some("hash-existing"),
+            None,
+        )
+        .expect("seed verified duplicate");
+        db.mark_event(
+            existing_event_id,
+            crate::app::types::EventStatus::Completed,
+            &existing_event_root,
+            1,
+            0,
+            1,
+            summary.total_size_bytes,
+            false,
+        )
+        .expect("complete duplicate source event");
+
+        let request = SessionRequest {
+            source_drive: source.clone(),
+            client_name: "Client Five".into(),
+            event_name: "Barat".into(),
+            camera_label_override: None,
+            skip_already_copied: false,
+            base_path: base.clone(),
+            scan: summary,
+        };
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let report = runtime
+            .block_on(engine.run_session(request, Arc::new(AtomicBool::new(false)), |_| {}))
+            .expect("run session");
+
+        let expected_dest = base
+            .join("Client Five")
+            .join("Barat")
+            .join("Photos")
+            .join("A001.ARW");
+        assert!(
+            expected_dest.exists(),
+            "expected copied file at {}",
+            expected_dest.display()
+        );
+        assert_eq!(report.verified_files, 1);
         assert!(
             report
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("Resuming existing ingest"))
+                .any(|warning| { warning.contains("ignored because destination file is missing") }),
+            "expected warning about stale duplicate destination"
         );
+    }
+
+    #[test]
+    fn unreadable_duplicate_candidate_does_not_abort_ingest() {
+        let temp = tempdir().expect("temp dir");
+        let source = temp.path().join("new_card");
+        let old_source = temp.path().join("old_card");
+        let base = temp.path().join("dest");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&old_source).expect("create old source");
+        fs::create_dir_all(&base).expect("create base");
+        let src = source.join("A001.ARW");
+        let old_src = old_source.join("OLD001.ARW");
+        fs::write(&src, b"rawdata").expect("write source file");
+        fs::write(&old_src, b"rawdata").expect("write old source file");
+
+        let file = make_scanned_file(&src, MediaType::PhotoRaw);
+        let old_file = make_scanned_file(&old_src, MediaType::PhotoRaw);
+        let summary = ScanSummary {
+            manufacturer: "Sony".into(),
+            drive_root: source.clone(),
+            card_label: Some(source.display().to_string()),
+            total_size_bytes: file.size_bytes,
+            total_files: 1,
+            raw_count: 1,
+            jpg_count: 0,
+            video_count: 0,
+            audio_count: 0,
+            skipped_count: 0,
+            files: vec![file.clone()],
+        };
+
+        let paths = test_paths(temp.path());
+        paths.ensure().expect("ensure paths");
+        let db = Database::open(&paths).expect("db open");
+        let settings = make_settings(&base);
+        let engine = IngestEngine::new(db.clone(), settings, paths);
+
+        let client_id = db
+            .upsert_client("Client Eight", &base, None)
+            .expect("upsert client");
+        let existing_event_root = base.join("Client Eight").join("Barat");
+        let existing_event_id = db
+            .prepare_event(client_id, "Barat", &existing_event_root)
+            .expect("prepare event");
+        let unreadable_dest = existing_event_root.join("Photos").join("A001.ARW");
+        fs::create_dir_all(&unreadable_dest).expect("create unreadable duplicate directory");
+        db.ensure_file_row(
+            existing_event_id,
+            &old_file,
+            &unreadable_dest,
+            crate::app::types::FileStatus::Pending,
+        )
+        .expect("seed duplicate file row");
+        db.update_file_status(
+            existing_event_id,
+            &old_file.source_path,
+            &unreadable_dest,
+            crate::app::types::FileStatus::Verified,
+            Some("hash-existing"),
+            None,
+        )
+        .expect("seed verified duplicate");
+        db.mark_event(
+            existing_event_id,
+            crate::app::types::EventStatus::Completed,
+            &existing_event_root,
+            1,
+            0,
+            1,
+            summary.total_size_bytes,
+            false,
+        )
+        .expect("complete duplicate source event");
+
+        let request = SessionRequest {
+            source_drive: source.clone(),
+            client_name: "Client Eight".into(),
+            event_name: "Walima".into(),
+            camera_label_override: None,
+            skip_already_copied: true,
+            base_path: base.clone(),
+            scan: summary,
+        };
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let report = runtime
+            .block_on(engine.run_session(request, Arc::new(AtomicBool::new(false)), |_| {}))
+            .expect("run session");
+
+        let expected_dest = base
+            .join("Client Eight")
+            .join("Walima")
+            .join("Photos")
+            .join("A001.ARW");
+        assert!(
+            expected_dest.exists(),
+            "expected copied file at {}",
+            expected_dest.display()
+        );
+        assert_eq!(report.verified_files, 1);
+        assert!(
+            report.warnings.iter().any(|warning| {
+                warning.contains("previous copy could not be read")
+            }),
+            "expected warning about unreadable duplicate candidate"
+        );
+    }
+
+    #[test]
+    fn skipped_duplicate_still_records_total_file_count() {
+        let temp = tempdir().expect("temp dir");
+        let source = temp.path().join("card");
+        let base = temp.path().join("dest");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&base).expect("create base");
+        let src = source.join("A001.ARW");
+        fs::write(&src, b"rawdata").expect("write source file");
+
+        let file = make_scanned_file(&src, MediaType::PhotoRaw);
+        let summary = ScanSummary {
+            manufacturer: "Sony".into(),
+            drive_root: source.clone(),
+            card_label: Some(source.display().to_string()),
+            total_size_bytes: file.size_bytes,
+            total_files: 1,
+            raw_count: 1,
+            jpg_count: 0,
+            video_count: 0,
+            audio_count: 0,
+            skipped_count: 0,
+            files: vec![file.clone()],
+        };
+
+        let paths = test_paths(temp.path());
+        paths.ensure().expect("ensure paths");
+        let db = Database::open(&paths).expect("db open");
+        let settings = make_settings(&base);
+        let engine = IngestEngine::new(db.clone(), settings, paths);
+
+        let client_id = db
+            .upsert_client("Client Six", &base, None)
+            .expect("upsert client");
+        let existing_event_root = base.join("Client Six").join("Barat");
+        let existing_event_id = db
+            .prepare_event(client_id, "Barat", &existing_event_root)
+            .expect("prepare event");
+        let duplicate_dest = existing_event_root.join("Photos").join("A001.ARW");
+        if let Some(parent) = duplicate_dest.parent() {
+            fs::create_dir_all(parent).expect("create duplicate destination parent");
+        }
+        fs::write(&duplicate_dest, b"rawdata").expect("write duplicate destination");
+        db.ensure_file_row(
+            existing_event_id,
+            &file,
+            &duplicate_dest,
+            crate::app::types::FileStatus::Pending,
+        )
+        .expect("seed duplicate file row");
+        db.update_file_status(
+            existing_event_id,
+            &file.source_path,
+            &duplicate_dest,
+            crate::app::types::FileStatus::Verified,
+            Some("hash-existing"),
+            None,
+        )
+        .expect("seed verified duplicate");
+        db.mark_event(
+            existing_event_id,
+            crate::app::types::EventStatus::Completed,
+            &existing_event_root,
+            1,
+            0,
+            1,
+            summary.total_size_bytes,
+            false,
+        )
+        .expect("complete duplicate source event");
+
+        let request = SessionRequest {
+            source_drive: source.clone(),
+            client_name: "Client Six".into(),
+            event_name: "Barat".into(),
+            camera_label_override: None,
+            skip_already_copied: false,
+            base_path: base.clone(),
+            scan: summary,
+        };
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let report = runtime
+            .block_on(engine.run_session(request, Arc::new(AtomicBool::new(false)), |_| {}))
+            .expect("run session");
+
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Skipped duplicate")));
+        let events = db.recent_events(1).expect("read recent events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].total_files, 1);
+        assert_eq!(events[0].verified_files, 0);
+    }
+
+    #[test]
+    fn cross_event_duplicate_is_skipped_when_option_is_enabled() {
+        let temp = tempdir().expect("temp dir");
+        let source = temp.path().join("new_card");
+        let old_source = temp.path().join("old_card");
+        let base = temp.path().join("dest");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&old_source).expect("create old source");
+        fs::create_dir_all(&base).expect("create base");
+        let src = source.join("B777.ARW");
+        let old_src = old_source.join("A001.ARW");
+        fs::write(&src, b"rawdata").expect("write source file");
+        fs::write(&old_src, b"rawdata").expect("write old source file");
+
+        let file = make_scanned_file(&src, MediaType::PhotoRaw);
+        let old_file = make_scanned_file(&old_src, MediaType::PhotoRaw);
+        let summary = ScanSummary {
+            manufacturer: "Sony".into(),
+            drive_root: source.clone(),
+            card_label: Some(source.display().to_string()),
+            total_size_bytes: file.size_bytes,
+            total_files: 1,
+            raw_count: 1,
+            jpg_count: 0,
+            video_count: 0,
+            audio_count: 0,
+            skipped_count: 0,
+            files: vec![file.clone()],
+        };
+
+        let paths = test_paths(temp.path());
+        paths.ensure().expect("ensure paths");
+        let db = Database::open(&paths).expect("db open");
+        let settings = make_settings(&base);
+        let engine = IngestEngine::new(db.clone(), settings, paths);
+
+        let client_id = db
+            .upsert_client("Client Seven", &base, None)
+            .expect("upsert client");
+        let existing_event_root = base.join("Client Seven").join("Barat");
+        let existing_event_id = db
+            .prepare_event(client_id, "Barat", &existing_event_root)
+            .expect("prepare event");
+        let duplicate_dest = existing_event_root.join("Photos").join("A001.ARW");
+        if let Some(parent) = duplicate_dest.parent() {
+            fs::create_dir_all(parent).expect("create duplicate destination parent");
+        }
+        fs::write(&duplicate_dest, b"rawdata").expect("write duplicate destination");
+        db.ensure_file_row(
+            existing_event_id,
+            &old_file,
+            &duplicate_dest,
+            crate::app::types::FileStatus::Pending,
+        )
+        .expect("seed duplicate file row");
+        db.update_file_status(
+            existing_event_id,
+            &old_file.source_path,
+            &duplicate_dest,
+            crate::app::types::FileStatus::Verified,
+            Some("hash-existing"),
+            None,
+        )
+        .expect("seed verified duplicate");
+        db.mark_event(
+            existing_event_id,
+            crate::app::types::EventStatus::Completed,
+            &existing_event_root,
+            1,
+            0,
+            1,
+            summary.total_size_bytes,
+            false,
+        )
+        .expect("complete duplicate source event");
+
+        let request = SessionRequest {
+            source_drive: source.clone(),
+            client_name: "Client Seven".into(),
+            event_name: "Walima".into(),
+            camera_label_override: None,
+            skip_already_copied: true,
+            base_path: base.clone(),
+            scan: summary,
+        };
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let report = runtime
+            .block_on(engine.run_session(request, Arc::new(AtomicBool::new(false)), |_| {}))
+            .expect("run session");
+
+        let new_event_dest = base
+            .join("Client Seven")
+            .join("Walima")
+            .join("Photos")
+            .join("A001.ARW");
+        assert!(
+            !new_event_dest.exists(),
+            "duplicate should not be recopied into {}",
+            new_event_dest.display()
+        );
+        assert_eq!(report.verified_files, 0);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Skipped duplicate")));
     }
 
     #[test]
@@ -917,16 +1554,17 @@ mod tests {
             client_name: "Client Three".into(),
             event_name: "Walima".into(),
             camera_label_override: Some("Cam A".into()),
+            skip_already_copied: false,
             base_path: base,
             scan: summary,
         };
 
-        let runtime = Builder::new_current_thread().enable_all().build().expect("runtime");
-        let result = runtime.block_on(engine.run_session(
-            request,
-            Arc::new(AtomicBool::new(false)),
-            |_| {},
-        ));
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result =
+            runtime.block_on(engine.run_session(request, Arc::new(AtomicBool::new(false)), |_| {}));
         let error_text = format!("{:#}", result.expect_err("expected preflight to fail"));
         assert!(error_text.contains("Destination drive full"));
     }
@@ -938,7 +1576,11 @@ mod tests {
         let base = temp.path().join("dest");
         fs::create_dir_all(source.join("DCIM").join("100MSDCF")).expect("create source");
         fs::create_dir_all(&base).expect("create base");
-        fs::write(source.join("DCIM").join("100MSDCF").join("A001.ARW"), b"rawdata").expect("write raw");
+        fs::write(
+            source.join("DCIM").join("100MSDCF").join("A001.ARW"),
+            b"rawdata",
+        )
+        .expect("write raw");
 
         let summary = scan_drive(&source, false, false).expect("scan");
         let paths = test_paths(temp.path());
@@ -952,11 +1594,15 @@ mod tests {
             client_name: "Client Four".into(),
             event_name: "Ubtan".into(),
             camera_label_override: None,
+            skip_already_copied: false,
             base_path: base.clone(),
             scan: summary,
         };
 
-        let runtime = Builder::new_current_thread().enable_all().build().expect("runtime");
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
         runtime
             .block_on(engine.run_session(request, Arc::new(AtomicBool::new(false)), |_| {}))
             .expect("run session");
@@ -966,6 +1612,10 @@ mod tests {
             .join("Ubtan")
             .join("Photos")
             .join("A001.ARW");
-        assert!(expected.exists(), "expected copied file at {}", expected.display());
+        assert!(
+            expected.exists(),
+            "expected copied file at {}",
+            expected.display()
+        );
     }
 }

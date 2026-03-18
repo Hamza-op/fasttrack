@@ -19,6 +19,9 @@ fn main() {
 
         let mut resource = winresource::WindowsResource::new();
         resource.set_manifest(manifest);
-        let _ = resource.compile();
+        resource.set_icon("assets/app_icon.ico");
+        resource
+            .compile()
+            .expect("failed to compile Windows resources");
     }
 }

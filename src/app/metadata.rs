@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::app::types::CameraMetadata;
 
+#[allow(dead_code)]
 pub fn detect_camera_metadata(path: &Path) -> CameraMetadata {
     let ext = path
         .extension()

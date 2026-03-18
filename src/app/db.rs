@@ -9,8 +9,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::app::settings::AppPaths;
 use crate::app::types::{
-    next_event_suggestion, ClientSummary, DuplicateRecord, EventOption, EventStatus, FileRecordSummary,
-    FileStatus, HistoryEvent, ResumableEvent, ScannedFile, StoredFileRecord,
+    next_event_suggestion, ClientSummary, DuplicateRecord, EventOption, EventStatus,
+    FileRecordSummary, FileStatus, HistoryEvent, ResumableEvent, ScannedFile, StoredFileRecord,
 };
 
 const SCHEMA_VERSION: &str = "1";
@@ -135,6 +135,7 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_files_event ON files(event_id);
                 CREATE INDEX IF NOT EXISTS idx_files_hash ON files(xxh3_hash);
                 CREATE INDEX IF NOT EXISTS idx_files_duplicate_lookup ON files(filename, size_bytes, source_created);
+                CREATE INDEX IF NOT EXISTS idx_files_duplicate_identity_lookup ON files(size_bytes, source_created, source_modified, media_type);
                 CREATE INDEX IF NOT EXISTS idx_files_event_status ON files(event_id, status);
                 CREATE INDEX IF NOT EXISTS idx_events_client ON events(client_id);
                 CREATE INDEX IF NOT EXISTS idx_events_completed_totals ON events(status, total_files, total_bytes);
@@ -166,7 +167,14 @@ impl Database {
             migrate_table_if_incompatible(
                 connection,
                 "clients",
-                &["id", "name", "base_path", "notes", "created_at", "updated_at"],
+                &[
+                    "id",
+                    "name",
+                    "base_path",
+                    "notes",
+                    "created_at",
+                    "updated_at",
+                ],
             )?;
             migrate_table_if_incompatible(
                 connection,
@@ -207,11 +215,7 @@ impl Database {
                     "copied_at",
                 ],
             )?;
-            migrate_table_if_incompatible(
-                connection,
-                "settings",
-                &["key", "value"],
-            )?;
+            migrate_table_if_incompatible(connection, "settings", &["key", "value"])?;
             Ok(())
         })
     }
@@ -244,14 +248,16 @@ impl Database {
 
     fn integrity_value(&self) -> Result<String> {
         self.with_connection(|connection| {
-            let value: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+            let value: String =
+                connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
             Ok(value)
         })
     }
 
     fn quick_integrity_value(&self) -> Result<String> {
         self.with_connection(|connection| {
-            let value: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+            let value: String =
+                connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
             Ok(value)
         })
     }
@@ -338,15 +344,12 @@ impl Database {
                     LIMIT ?2
                     "#,
                 )?;
-                let rows = statement.query_map(
-                    params![contains, limit.max(1) as i64],
-                    |row| {
-                        Ok(ClientSummary {
-                            name: row.get(0)?,
-                            base_path: PathBuf::from(row.get::<_, String>(1)?),
-                        })
-                    },
-                )?;
+                let rows = statement.query_map(params![contains, limit.max(1) as i64], |row| {
+                    Ok(ClientSummary {
+                        name: row.get(0)?,
+                        base_path: PathBuf::from(row.get::<_, String>(1)?),
+                    })
+                })?;
                 for row in rows {
                     clients.push(row?);
                 }
@@ -380,7 +383,12 @@ impl Database {
         })
     }
 
-    pub fn upsert_client(&self, client_name: &str, base_path: &Path, notes: Option<&str>) -> Result<i64> {
+    pub fn upsert_client(
+        &self,
+        client_name: &str,
+        base_path: &Path,
+        notes: Option<&str>,
+    ) -> Result<i64> {
         self.with_connection(|connection| {
             connection.execute(
                 r#"
@@ -455,7 +463,8 @@ impl Database {
                   AND e.status = 'completed'
                 "#,
             )?;
-            let completed_rows = completed_statement.query_map(params![client_name], |row| row.get::<_, String>(0))?;
+            let completed_rows = completed_statement
+                .query_map(params![client_name], |row| row.get::<_, String>(0))?;
             let mut completed = Vec::new();
             for row in completed_rows {
                 completed.push(row?);
@@ -469,15 +478,19 @@ impl Database {
                 })
                 .collect::<Vec<_>>();
 
-            let mut custom_statement = connection.prepare(
-                "SELECT name FROM custom_events ORDER BY created_at ASC, name ASC",
-            )?;
+            let mut custom_statement = connection
+                .prepare("SELECT name FROM custom_events ORDER BY created_at ASC, name ASC")?;
             let custom_rows = custom_statement.query_map([], |row| row.get::<_, String>(0))?;
             for row in custom_rows {
                 let name = row?;
-                if options.iter().all(|option| !option.name.eq_ignore_ascii_case(&name)) {
+                if options
+                    .iter()
+                    .all(|option| !option.name.eq_ignore_ascii_case(&name))
+                {
                     options.push(EventOption {
-                        completed: completed.iter().any(|item| item.eq_ignore_ascii_case(&name)),
+                        completed: completed
+                            .iter()
+                            .any(|item| item.eq_ignore_ascii_case(&name)),
                         name,
                     });
                 }
@@ -526,7 +539,11 @@ impl Database {
         Ok(options)
     }
 
-    pub fn resumable_event(&self, client_name: &str, event_name: &str) -> Result<Option<ResumableEvent>> {
+    pub fn resumable_event(
+        &self,
+        client_name: &str,
+        event_name: &str,
+    ) -> Result<Option<ResumableEvent>> {
         self.with_connection(|connection| {
             let resumable = connection
                 .query_row(
@@ -619,7 +636,11 @@ impl Database {
         })
     }
 
-    pub fn latest_event_for_client_event(&self, client_name: &str, event_name: &str) -> Result<Option<HistoryEvent>> {
+    pub fn latest_event_for_client_event(
+        &self,
+        client_name: &str,
+        event_name: &str,
+    ) -> Result<Option<HistoryEvent>> {
         self.with_connection(|connection| {
             let event = connection
                 .query_row(
@@ -651,7 +672,12 @@ impl Database {
         })
     }
 
-    pub fn prepare_event(&self, client_id: i64, event_name: &str, destination_path: &Path) -> Result<i64> {
+    pub fn prepare_event(
+        &self,
+        client_id: i64,
+        event_name: &str,
+        destination_path: &Path,
+    ) -> Result<i64> {
         self.with_connection(|connection| {
             let existing = connection
                 .query_row(
@@ -718,33 +744,52 @@ impl Database {
         })
     }
 
-    pub fn find_duplicate_for_client(&self, client_name: &str, file: &ScannedFile) -> Result<Option<DuplicateRecord>> {
+    pub fn find_duplicate_candidates_for_client(
+        &self,
+        client_name: &str,
+        file: &ScannedFile,
+    ) -> Result<Vec<DuplicateRecord>> {
         self.with_connection(|connection| {
-            let duplicate = connection
-                .query_row(
+            let mut statement = connection.prepare(
                     r#"
-                    SELECT e.event_name, f.status, f.xxh3_hash
+                    SELECT e.event_name, f.xxh3_hash, f.dest_path
                     FROM files f
                     JOIN events e ON e.id = f.event_id
                     JOIN clients c ON c.id = e.client_id
                     WHERE c.name = ?1 COLLATE NOCASE
-                      AND f.filename = ?2
-                      AND f.size_bytes = ?3
-                      AND f.source_created = ?4
+                      AND e.status = 'completed'
+                      AND f.status = 'verified'
+                      AND f.size_bytes = ?2
+                      AND f.source_created = ?3
+                      AND f.source_modified = ?4
+                      AND f.media_type = ?5
                     ORDER BY f.id DESC
-                    LIMIT 1
+                    LIMIT 8
                     "#,
-                    params![client_name, file.filename, file.size_bytes as i64, file.source_created],
-                    |row| {
-                        Ok(DuplicateRecord {
-                            event_name: row.get(0)?,
-                            status: FileStatus::from_db(&row.get::<_, String>(1)?),
-                            xxh3_hash: row.get(2)?,
-                        })
-                    },
-                )
-                .optional()?;
-            Ok(duplicate)
+                )?;
+            let rows = statement.query_map(
+                params![
+                    client_name,
+                    file.size_bytes as i64,
+                    file.source_created,
+                    file.source_modified,
+                    file.media_type.db_value(),
+                ],
+                |row| {
+                    Ok(DuplicateRecord {
+                        event_name: row.get(0)?,
+                        status: FileStatus::Verified,
+                        xxh3_hash: row.get(1)?,
+                        dest_path: PathBuf::from(row.get::<_, String>(2)?),
+                    })
+                },
+            )?;
+
+            let mut duplicates = Vec::new();
+            for row in rows {
+                duplicates.push(row?);
+            }
+            Ok(duplicates)
         })
     }
 
@@ -859,7 +904,13 @@ impl Database {
         })
     }
 
-    pub fn ensure_file_row(&self, event_id: i64, file: &ScannedFile, dest_path: &Path, status: FileStatus) -> Result<()> {
+    pub fn ensure_file_row(
+        &self,
+        event_id: i64,
+        file: &ScannedFile,
+        dest_path: &Path,
+        status: FileStatus,
+    ) -> Result<()> {
         self.with_connection(|connection| {
             connection.execute(
                 r#"
@@ -931,6 +982,7 @@ impl Database {
         destination_path: &Path,
         verified_files: usize,
         failed_files: usize,
+        total_files: usize,
         total_bytes: u64,
         locked: bool,
     ) -> Result<()> {
@@ -954,7 +1006,7 @@ impl Database {
                     destination_path.display().to_string(),
                     verified_files as i64,
                     failed_files as i64,
-                    (verified_files + failed_files) as i64,
+                    total_files as i64,
                     total_bytes as i64,
                     if locked { 1 } else { 0 },
                     Utc::now().to_rfc3339()
@@ -974,7 +1026,11 @@ impl Database {
         })
     }
 
-    pub fn manifest_records(&self, event_id: i64, event_root: &Path) -> Result<Vec<FileRecordSummary>> {
+    pub fn manifest_records(
+        &self,
+        event_id: i64,
+        event_root: &Path,
+    ) -> Result<Vec<FileRecordSummary>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
                 r#"
@@ -1040,14 +1096,8 @@ fn db_signature(
         source_created,
         source_modified,
         media_type,
-        camera_model
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase(),
-        camera_serial
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase(),
+        camera_model.unwrap_or("").trim().to_ascii_lowercase(),
+        camera_serial.unwrap_or("").trim().to_ascii_lowercase(),
     )
 }
 
@@ -1057,7 +1107,11 @@ fn migrate_table_if_incompatible(
     required_columns: &[&str],
 ) -> Result<()> {
     let columns = table_columns(connection, table_name)?;
-    if columns.is_empty() || required_columns.iter().all(|column| columns.iter().any(|value| value == column)) {
+    if columns.is_empty()
+        || required_columns
+            .iter()
+            .all(|column| columns.iter().any(|value| value == column))
+    {
         return Ok(());
     }
 
@@ -1071,7 +1125,9 @@ fn migrate_table_if_incompatible(
         .optional()?;
 
     if legacy_exists.is_none() {
-        connection.execute_batch(&format!("ALTER TABLE {table_name} RENAME TO {legacy_name};"))?;
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table_name} RENAME TO {legacy_name};"
+        ))?;
     } else {
         connection.execute_batch(&format!("DROP TABLE IF EXISTS {table_name};"))?;
     }
@@ -1087,7 +1143,9 @@ fn migrate_table_if_incompatible(
         )?;
     }
     if table_name == "files" {
-        connection.execute_batch("DROP INDEX IF EXISTS idx_files_hash; DROP INDEX IF EXISTS idx_files_event;")?;
+        connection.execute_batch(
+            "DROP INDEX IF EXISTS idx_files_hash; DROP INDEX IF EXISTS idx_files_event;",
+        )?;
     }
     if table_name == "events" {
         connection.execute_batch("DROP INDEX IF EXISTS idx_events_client;")?;
@@ -1162,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_duplicate_by_identity_tuple_for_same_client() {
+    fn finds_duplicate_candidates_by_identity_tuple_for_same_client() {
         let temp = tempdir().unwrap();
         let paths = test_paths(temp.path());
         fs::create_dir_all(&paths.root_dir).unwrap();
@@ -1172,7 +1230,11 @@ mod tests {
             .upsert_client("Ahmed Khan", Path::new(r"D:\Projects"), None)
             .unwrap();
         let event_id = db
-            .prepare_event(client_id, "Barat", Path::new(r"D:\Projects\Ahmed Khan\Barat"))
+            .prepare_event(
+                client_id,
+                "Barat",
+                Path::new(r"D:\Projects\Ahmed Khan\Barat"),
+            )
             .unwrap();
 
         let file = sample_file(Path::new(r"E:\C0001.MP4"), "C0001.MP4");
@@ -1188,13 +1250,24 @@ mod tests {
             None,
         )
         .unwrap();
+        db.mark_event(
+            event_id,
+            crate::app::types::EventStatus::Completed,
+            Path::new(r"D:\Projects\Ahmed Khan\Barat"),
+            1,
+            0,
+            1,
+            10,
+            false,
+        )
+        .unwrap();
 
-        let duplicate = db
-            .find_duplicate_for_client("Ahmed Khan", &file)
-            .unwrap()
+        let duplicates = db
+            .find_duplicate_candidates_for_client("Ahmed Khan", &file)
             .unwrap();
-        assert_eq!(duplicate.event_name, "Barat");
-        assert!(matches!(duplicate.status, FileStatus::Verified));
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].event_name, "Barat");
+        assert!(matches!(duplicates[0].status, FileStatus::Verified));
     }
 
     #[test]

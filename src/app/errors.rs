@@ -28,15 +28,11 @@ pub enum MoonError {
         dest_hash: String,
     },
 
-
-
     #[error("No recognized media found on drive {drive}")]
     NoMediaFound { drive: String },
 
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
-
-
 
     #[error("Cannot set attributes on '{path}': {source}")]
     AttributeError {
@@ -55,8 +51,9 @@ pub enum MoonError {
         max: usize,
     },
 
+    #[error("Scan cancelled by user")]
+    ScanCancelled,
+
     #[error("Ingest cancelled by user after {copied} of {total} files")]
     Cancelled { copied: u32, total: u32 },
-
-
 }

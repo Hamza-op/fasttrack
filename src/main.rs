@@ -13,17 +13,18 @@ use anyhow::{anyhow, bail, Result};
 use app::db::Database;
 use app::drive_monitor::detect_drives;
 use app::ingest::IngestEngine;
-use app::scanner::scan_drive;
+use app::scanner::scan_drive_with_cancel;
 use app::settings::{AppPaths, Settings};
 use app::types::{
-    next_event_suggestion, ClientSummary, EventOption, ScanSummary, SessionRequest, validate_folder_name,
+    next_event_suggestion, validate_folder_name, ClientSummary, EventOption, ScanSummary,
+    SessionRequest,
 };
 use chrono::Local;
 use rfd::FileDialog;
 use slint::ComponentHandle;
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::EnvFilter;
 
 slint::include_modules!();
 
@@ -32,7 +33,7 @@ use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use windows::core::PCWSTR;
 #[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 #[cfg(windows)]
 use windows::Win32::System::Threading::CreateMutexW;
 
@@ -48,6 +49,8 @@ struct AppState {
     settings: Settings,
     current_scan: Arc<Mutex<Option<ScanSummary>>>,
     cancel_flag: Arc<AtomicBool>,
+    operation_active: Arc<AtomicBool>,
+    last_auto_source: Arc<Mutex<Option<String>>>,
     client_query_seq: Arc<AtomicU64>,
     event_query_seq: Arc<AtomicU64>,
     mock_mode: bool,
@@ -68,15 +71,28 @@ fn main() -> Result<()> {
         settings: settings.clone(),
         current_scan: Arc::new(Mutex::new(None)),
         cancel_flag: Arc::new(AtomicBool::new(false)),
+        operation_active: Arc::new(AtomicBool::new(false)),
+        last_auto_source: Arc::new(Mutex::new(None)),
         client_query_seq: Arc::new(AtomicU64::new(0)),
         event_query_seq: Arc::new(AtomicU64::new(0)),
         mock_mode,
     };
 
     let window = AppWindow::new()?;
-    window.set_base_path(settings.general.default_base_path.display().to_string().into());
+    window.set_base_path(
+        settings
+            .general
+            .default_base_path
+            .display()
+            .to_string()
+            .into(),
+    );
     let initial_event_options = db.event_options("").unwrap_or_default();
-    apply_event_menu(&window, &initial_event_options, &window.get_event_name().to_string());
+    apply_event_menu(
+        &window,
+        &initial_event_options,
+        &window.get_event_name().to_string(),
+    );
     if mock_mode {
         apply_mock_bootstrap(&window);
     }
@@ -95,9 +111,11 @@ fn main() -> Result<()> {
     wire_suggest_client(&window, state.clone());
     wire_client_typing_suggestions(&window, state.clone());
     wire_event_typing_suggestions(&window, state.clone());
-    wire_select_source_path(&window);
+    wire_source_drive_edit(&window, state.clone());
+    wire_select_source_path(&window, state.clone());
+    wire_select_base_path(&window);
     wire_history(&window, state.clone());
-    start_drive_polling(&window, mock_mode);
+    start_drive_polling(&window, state.clone(), mock_mode);
 
     window.run()?;
     Ok(())
@@ -115,32 +133,27 @@ fn wire_refresh(window: &AppWindow, state: AppState) {
             return;
         }
         let weak = weak.clone();
-        let _state = state.clone();
+        let state = state.clone();
         thread::spawn(move || match detect_drives() {
             Ok(drives) => {
-                let source_drive = drives
-                    .first()
-                    .map(|drive| drive.root.display().to_string())
-                    .unwrap_or_default();
-                let text = if drives.is_empty() {
-                    "No candidate media cards detected.".to_string()
-                } else {
-                    drives
-                        .iter()
-                        .map(|drive| {
-                            format!(
-                                "{} (free {})",
-                                drive.label,
-                                app::types::format_bytes(drive.free_bytes)
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
+                let source_drive = primary_auto_scan_source(&drives);
+                let text = format_detected_drives(&drives);
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_drives_text(text.into());
-                    ui.set_source_drive(source_drive.into());
-                    ui.set_status_text("Drive refresh complete.".into());
+                    if !can_apply_auto_source(&state, &ui.get_source_drive().to_string(), &source_drive)
+                    {
+                        ui.set_status_text("Drive refresh complete.".into());
+                        return;
+                    }
+
+                    apply_source_change(
+                        &state,
+                        &ui,
+                        &source_drive,
+                        SourceChangeOrigin::AutoDetected,
+                        true,
+                        "Removable media detected. Starting scan...",
+                    );
                 });
                 info!("drive refresh complete");
             }
@@ -152,46 +165,48 @@ fn wire_refresh(window: &AppWindow, state: AppState) {
     });
 }
 
-fn start_drive_polling(window: &AppWindow, mock_mode: bool) {
+fn start_drive_polling(window: &AppWindow, state: AppState, mock_mode: bool) {
     if mock_mode {
         return;
     }
     let weak = window.as_weak();
     thread::spawn(move || {
         let mut last_snapshot = String::new();
+        let mut last_primary_signature = String::new();
         loop {
             let Some(_) = weak.upgrade() else {
                 break;
             };
             match detect_drives() {
                 Ok(drives) => {
-                    let source_drive = drives
-                        .first()
-                        .map(|drive| drive.root.display().to_string())
-                        .unwrap_or_default();
-                    let snapshot = if drives.is_empty() {
-                        String::new()
-                    } else {
-                        drives
-                            .iter()
-                            .map(|drive| {
-                                format!(
-                                    "{} (free {})",
-                                    drive.label,
-                                    app::types::format_bytes(drive.free_bytes)
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    };
+                    let source_drive = primary_auto_scan_source(&drives);
+                    let snapshot = format_detected_drives(&drives);
+                    let primary_signature = primary_detected_signature(&drives);
+                    let snapshot_changed = snapshot != last_snapshot;
+                    let primary_changed = primary_signature != last_primary_signature;
 
-                    if snapshot != last_snapshot {
+                    if snapshot_changed || primary_changed {
                         last_snapshot = snapshot.clone();
+                        last_primary_signature = primary_signature.clone();
+                        let state = state.clone();
                         let _ = weak.upgrade_in_event_loop(move |ui| {
                             ui.set_drives_text(snapshot.into());
-                            if ui.get_source_drive().to_string().trim().is_empty() {
-                                ui.set_source_drive(source_drive.into());
+                            if !can_apply_auto_source(
+                                &state,
+                                &ui.get_source_drive().to_string(),
+                                &source_drive,
+                            ) {
+                                return;
                             }
+
+                            apply_source_change(
+                                &state,
+                                &ui,
+                                &source_drive,
+                                SourceChangeOrigin::AutoDetected,
+                                true,
+                                "Removable media detected. Starting scan...",
+                            );
                         });
                     }
                 }
@@ -205,6 +220,13 @@ fn start_drive_polling(window: &AppWindow, mock_mode: bool) {
 fn wire_scan(window: &AppWindow, state: AppState) {
     let weak = window.as_weak();
     window.on_scan_card(move || {
+        if state.operation_active.load(Ordering::Relaxed) {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_status_text("Another operation is already running.".into());
+            }
+            return;
+        }
+
         if state.mock_mode {
             if let Err(error) = set_current_scan(&state, Some(mock_scan_summary())) {
                 if let Some(ui) = weak.upgrade() {
@@ -219,9 +241,10 @@ fn wire_scan(window: &AppWindow, state: AppState) {
                 ui.set_event_name("Barat".into());
                 ui.set_base_path(r"D:\Projects".into());
                 ui.set_status_text(
-                    "Mock scan complete: Sony 12 files · RAW 6 · JPG 3 · Video 2 · Audio 1 · 4.8 GB"
+                    "Mock scan complete: Sony 12 files · RAW 6 · JPG/PNG 3 · Video 2 · Audio 1 · 4.8 GB"
                         .into(),
                 );
+                ui.set_progress_label("Ready to ingest.".into());
                 ui.set_report_text(mock_report_text().into());
             }
             return;
@@ -237,14 +260,32 @@ fn wire_scan(window: &AppWindow, state: AppState) {
             return;
         }
 
+        if let Some(ui) = weak.upgrade() {
+            state.cancel_flag.store(false, Ordering::Relaxed);
+            state.operation_active.store(true, Ordering::Relaxed);
+            ui.set_status_text("Scanning source...".into());
+            ui.set_progress_label("Reading files and building media inventory.".into());
+            ui.set_report_text(
+                format!(
+                    "Scan started for {}\nPlease wait while FastTrack scans supported media files.",
+                    source_drive.trim()
+                )
+                .into(),
+            );
+            ui.set_progress_percent(0.0);
+            ui.set_verify_percent(0.0);
+        }
+
         let weak = weak.clone();
         let state = state.clone();
         thread::spawn(move || {
-            let root = std::path::PathBuf::from(source_drive.trim());
-            match scan_drive(
+            let source_drive_trimmed = source_drive.trim().to_string();
+            let root = std::path::PathBuf::from(&source_drive_trimmed);
+            match scan_drive_with_cancel(
                 &root,
                 state.settings.ingest.include_proxy_files,
                 state.settings.ingest.skip_hidden_files,
+                Some(state.cancel_flag.clone()),
             ) {
                 Ok(scan) => {
                     let current_client = weak
@@ -260,6 +301,7 @@ fn wire_scan(window: &AppWindow, state: AppState) {
                             .unwrap_or_else(|_| next_event_suggestion(&[]))
                     };
                     if let Err(error) = set_current_scan(&state, Some(scan.clone())) {
+                        state.operation_active.store(false, Ordering::Relaxed);
                         let _ = weak.upgrade_in_event_loop(move |ui| {
                             ui.set_status_text(format!("Scan cache error: {error}").into())
                         });
@@ -307,6 +349,7 @@ fn wire_scan(window: &AppWindow, state: AppState) {
                         } else {
                             ui.set_status_text(format!("Scan complete: {summary}").into());
                         }
+                        ui.set_progress_label("Ready to ingest.".into());
                         ui.set_report_text(
                             duplicate_prompt
                                 .or(resume_hint)
@@ -314,11 +357,35 @@ fn wire_scan(window: &AppWindow, state: AppState) {
                                 .into(),
                         );
                     });
+                    state.operation_active.store(false, Ordering::Relaxed);
                 }
                 Err(error) => {
+                    let scan_cancelled = error
+                        .downcast_ref::<app::errors::MoonError>()
+                        .is_some_and(|value| matches!(value, app::errors::MoonError::ScanCancelled));
+                    let error_text = format!("{error:#}");
                     let _ = weak.upgrade_in_event_loop(move |ui| {
-                        ui.set_status_text(format!("Scan failed: {error:#}").into())
+                        if scan_cancelled {
+                            ui.set_status_text("Scan cancelled.".into());
+                            ui.set_progress_label("Scan cancelled.".into());
+                            ui.set_report_text(
+                                format!("Scan cancelled for {}.", source_drive_trimmed).into(),
+                            );
+                        } else {
+                            ui.set_status_text(format!("Scan failed: {error_text}").into());
+                            ui.set_progress_label("Scan failed.".into());
+                            ui.set_report_text(
+                                format!(
+                                    "Scan failed for {}\n{}",
+                                    source_drive_trimmed, error_text
+                                )
+                                .into(),
+                            );
+                        }
+                        ui.set_progress_percent(0.0);
+                        ui.set_verify_percent(0.0);
                     });
+                    state.operation_active.store(false, Ordering::Relaxed);
                 }
             }
         });
@@ -364,8 +431,17 @@ fn wire_start(window: &AppWindow, state: AppState) {
                 return;
             }
         };
+        if !same_source_path(
+            &source_drive.display().to_string(),
+            &scan.drive_root.display().to_string(),
+        ) {
+            let _ = set_current_scan(&state, None);
+            ui.set_status_text("Source changed since last scan. Run scan again.".into());
+            return;
+        }
 
         state.cancel_flag.store(false, Ordering::Relaxed);
+        state.operation_active.store(true, Ordering::Relaxed);
         ui.set_status_text("Starting ingest...".into());
 
         let request = SessionRequest {
@@ -373,19 +449,24 @@ fn wire_start(window: &AppWindow, state: AppState) {
             client_name,
             event_name,
             camera_label_override: (!camera_label.trim().is_empty()).then_some(camera_label),
+            skip_already_copied: ui.get_skip_already_copied(),
             base_path,
             scan,
         };
 
         let weak = weak.clone();
         let state = state.clone();
-        if let Ok(Some(resume)) = state.db.resumable_event(&request.client_name, &request.event_name) {
+        if let Ok(Some(resume)) = state
+            .db
+            .resumable_event(&request.client_name, &request.event_name)
+        {
             ui.set_status_text(format!("Resuming: {}", format_resume(&resume)).into());
         }
         thread::spawn(move || {
             let paths = match AppPaths::discover() {
                 Ok(paths) => paths,
                 Err(error) => {
+                    state.operation_active.store(false, Ordering::Relaxed);
                     let _ = weak.upgrade_in_event_loop(move |ui| {
                         ui.set_status_text(format!("Cannot prepare app paths: {error:#}").into());
                         ui.set_progress_label("Failed".into());
@@ -400,6 +481,7 @@ fn wire_start(window: &AppWindow, state: AppState) {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    state.operation_active.store(false, Ordering::Relaxed);
                     let _ = weak.upgrade_in_event_loop(move |ui| {
                         ui.set_status_text(format!("Runtime startup failed: {error:#}").into());
                         ui.set_progress_label("Failed".into());
@@ -475,6 +557,7 @@ fn wire_start(window: &AppWindow, state: AppState) {
             match result {
                 Ok(Ok(report)) => {
                     let text = report.to_text();
+                    state.operation_active.store(false, Ordering::Relaxed);
                     let _ = weak.upgrade_in_event_loop(move |ui| {
                         ui.set_status_text("Ingest complete.".into());
                         ui.set_report_text(text.into());
@@ -484,14 +567,18 @@ fn wire_start(window: &AppWindow, state: AppState) {
                     });
                 }
                 Ok(Err(error)) => {
+                    state.operation_active.store(false, Ordering::Relaxed);
+                    let error_text = format!("{error:#}");
                     let _ = weak.upgrade_in_event_loop(move |ui| {
-                        ui.set_status_text(format!("Ingest failed: {error:#}").into());
+                        ui.set_status_text(format!("Ingest failed: {error_text}").into());
                         ui.set_progress_percent(0.0);
                         ui.set_verify_percent(0.0);
                         ui.set_progress_label("Failed".into());
+                        ui.set_report_text(format!("Ingest failed.\n{error_text}").into());
                     });
                 }
                 Err(_) => {
+                    state.operation_active.store(false, Ordering::Relaxed);
                     let _ = weak.upgrade_in_event_loop(move |ui| {
                         ui.set_status_text(
                             "Ingest crashed unexpectedly. Check logs and try again.".into(),
@@ -511,7 +598,8 @@ fn wire_cancel(window: &AppWindow, state: AppState) {
     window.on_cancel_ingest(move || {
         state.cancel_flag.store(true, Ordering::Relaxed);
         if let Some(ui) = weak.upgrade() {
-            ui.set_status_text("Stopping ingest...".into());
+            ui.set_status_text("Cancelling current operation...".into());
+            ui.set_progress_label("Cancelling...".into());
         }
     });
 }
@@ -659,13 +747,14 @@ fn wire_event_typing_suggestions(window: &AppWindow, state: AppState) {
                 Ok(options) => options,
                 Err(_) => return,
             };
-            let options = match state
-                .db
-                .search_event_options(client_name.trim(), event_query.trim(), 8)
-            {
-                Ok(options) => options,
-                Err(_) => return,
-            };
+            let options =
+                match state
+                    .db
+                    .search_event_options(client_name.trim(), event_query.trim(), 8)
+                {
+                    Ok(options) => options,
+                    Err(_) => return,
+                };
             if state.event_query_seq.load(Ordering::Relaxed) != request_id {
                 return;
             }
@@ -698,20 +787,73 @@ fn wire_event_typing_suggestions(window: &AppWindow, state: AppState) {
     });
 }
 
-fn wire_select_source_path(window: &AppWindow) {
+fn wire_source_drive_edit(window: &AppWindow, state: AppState) {
+    let weak = window.as_weak();
+    window.on_source_drive_edited(move |value| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        apply_source_change(
+            &state,
+            &ui,
+            &value.to_string(),
+            SourceChangeOrigin::Manual,
+            false,
+            "Source changed. Scan again before ingest.",
+        );
+    });
+}
+
+fn wire_select_source_path(window: &AppWindow, state: AppState) {
     let weak = window.as_weak();
     window.on_select_source_path(move || {
-        let picked = FileDialog::new()
-            .set_title("Select source drive or folder")
-            .pick_folder();
+        let mut dialog = FileDialog::new().set_title("Select source drive or folder");
+        if let Some(ui) = weak.upgrade() {
+            let current = std::path::PathBuf::from(ui.get_source_drive().to_string());
+            if current.exists() {
+                dialog = dialog.set_directory(current);
+            }
+        }
+
+        let picked = dialog.pick_folder();
 
         let Some(path) = picked else {
             return;
         };
 
         if let Some(ui) = weak.upgrade() {
-            ui.set_source_drive(path.display().to_string().into());
-            ui.set_status_text("Source path selected.".into());
+            apply_source_change(
+                &state,
+                &ui,
+                &path.display().to_string(),
+                SourceChangeOrigin::Manual,
+                true,
+                "Source path selected. Starting scan...",
+            );
+        }
+    });
+}
+
+fn wire_select_base_path(window: &AppWindow) {
+    let weak = window.as_weak();
+    window.on_select_base_path(move || {
+        let mut dialog = FileDialog::new().set_title("Select destination root");
+        if let Some(ui) = weak.upgrade() {
+            let current = std::path::PathBuf::from(ui.get_base_path().to_string());
+            if current.exists() {
+                dialog = dialog.set_directory(current);
+            }
+        }
+
+        let picked = dialog.pick_folder();
+
+        let Some(path) = picked else {
+            return;
+        };
+
+        if let Some(ui) = weak.upgrade() {
+            ui.set_base_path(path.display().to_string().into());
+            ui.set_status_text("Destination path selected.".into());
         }
     });
 }
@@ -806,6 +948,155 @@ fn set_current_scan(state: &AppState, scan: Option<ScanSummary>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum SourceChangeOrigin {
+    Manual,
+    AutoDetected,
+}
+
+fn apply_source_change(
+    state: &AppState,
+    ui: &AppWindow,
+    new_source: &str,
+    origin: SourceChangeOrigin,
+    start_scan: bool,
+    status_text: &str,
+) {
+    let new_source = new_source.trim();
+    let current_source = ui.get_source_drive().to_string();
+
+    if new_source.is_empty() {
+        let _ = set_current_scan(state, None);
+        let _ = set_last_auto_source(state, None);
+        ui.set_source_drive("".into());
+        ui.set_status_text(status_text.into());
+        return;
+    }
+
+    let scan_changed = invalidate_scan_for_source(state, new_source)
+        .map(|changed| changed || !same_source_path(&current_source, new_source))
+        .unwrap_or(false);
+
+    ui.set_source_drive(new_source.into());
+    match origin {
+        SourceChangeOrigin::Manual => {
+            let _ = set_last_auto_source(state, None);
+        }
+        SourceChangeOrigin::AutoDetected => {
+            let _ = set_last_auto_source(state, Some(new_source.to_string()));
+        }
+    }
+
+    if start_scan {
+        ui.set_status_text(status_text.into());
+        ui.invoke_scan_card();
+    } else if scan_changed {
+        ui.set_status_text(status_text.into());
+    }
+}
+
+fn can_apply_auto_source(state: &AppState, current_source: &str, candidate_source: &str) -> bool {
+    if candidate_source.trim().is_empty() || state.operation_active.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    let current_source = current_source.trim();
+    if current_source.is_empty() || same_source_path(current_source, candidate_source) {
+        return true;
+    }
+
+    get_last_auto_source(state)
+        .is_some_and(|last_auto| same_source_path(current_source, &last_auto))
+}
+
+fn invalidate_scan_for_source(state: &AppState, source: &str) -> Result<bool> {
+    let Some(scan) = get_current_scan(state)? else {
+        return Ok(false);
+    };
+
+    if same_source_path(&scan.drive_root.display().to_string(), source) {
+        return Ok(false);
+    }
+
+    set_current_scan(state, None)?;
+    Ok(true)
+}
+
+fn set_last_auto_source(state: &AppState, source: Option<String>) -> Result<()> {
+    let mut guard = state
+        .last_auto_source
+        .lock()
+        .map_err(|_| anyhow!("internal state error: auto source state unavailable"))?;
+    *guard = source;
+    Ok(())
+}
+
+fn get_last_auto_source(state: &AppState) -> Option<String> {
+    state
+        .last_auto_source
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+fn primary_auto_scan_source(drives: &[app::drive_monitor::DetectedDrive]) -> String {
+    drives
+        .iter()
+        .find(|drive| drive.is_removable)
+        .map(|drive| drive.root.display().to_string())
+        .unwrap_or_default()
+}
+
+fn primary_detected_signature(drives: &[app::drive_monitor::DetectedDrive]) -> String {
+    drives
+        .first()
+        .map(|drive| {
+            format!(
+                "{}|{}|{}",
+                drive.root.display(),
+                drive.label,
+                drive.free_bytes
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn format_detected_drives(drives: &[app::drive_monitor::DetectedDrive]) -> String {
+    if drives.is_empty() {
+        return "No candidate media cards detected.".to_string();
+    }
+
+    drives
+        .iter()
+        .map(|drive| {
+            format!(
+                "{} (free {})",
+                drive.label,
+                app::types::format_bytes(drive.free_bytes)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn same_source_path(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        left.eq_ignore_ascii_case(right)
+    }
+
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 fn get_current_scan(state: &AppState) -> Result<Option<ScanSummary>> {
     state
         .current_scan
@@ -829,10 +1120,7 @@ fn format_resume(resume: &app::types::ResumableEvent) -> String {
 fn format_history(events: &[app::types::HistoryEvent]) -> String {
     let mut text = String::from("Recent ingests:\n");
     for event in events {
-        let completed_at = event
-            .completed_at
-            .as_deref()
-            .unwrap_or("in progress");
+        let completed_at = event.completed_at.as_deref().unwrap_or("in progress");
         text.push_str(&format!(
             "- {} / {} [{:?}] {} of {} verified, locked: {}, completed: {}, path: {}\n",
             event.client_name,
@@ -979,11 +1267,36 @@ fn simulate_mock_ingest(weak: slint::Weak<AppWindow>) {
     thread::spawn(move || {
         let steps: Vec<(&str, f32, f32, &str)> = vec![
             ("Mock preflight passed.", 0.0, 0.0, "Preflight..."),
-            ("Mock copy: 3/12 files (1.2 GB / 4.8 GB).", 0.25, 0.0, "3 of 12 files (1.2 GB / 4.8 GB)"),
-            ("Mock copy: 8/12 files (3.7 GB / 4.8 GB).", 0.77, 0.0, "8 of 12 files (3.7 GB / 4.8 GB)"),
-            ("Mock copy: 12/12 files (4.8 GB / 4.8 GB).", 1.0, 0.5, "12 of 12 files · Verifying..."),
-            ("Mock verify: all copied files verified.", 1.0, 1.0, "12 of 12 verified"),
-            ("Mock ingest complete. 12/12 verified. No failures.", 1.0, 1.0, "Complete"),
+            (
+                "Mock copy: 3/12 files (1.2 GB / 4.8 GB).",
+                0.25,
+                0.0,
+                "3 of 12 files (1.2 GB / 4.8 GB)",
+            ),
+            (
+                "Mock copy: 8/12 files (3.7 GB / 4.8 GB).",
+                0.77,
+                0.0,
+                "8 of 12 files (3.7 GB / 4.8 GB)",
+            ),
+            (
+                "Mock copy: 12/12 files (4.8 GB / 4.8 GB).",
+                1.0,
+                0.5,
+                "12 of 12 files · Verifying...",
+            ),
+            (
+                "Mock verify: all copied files verified.",
+                1.0,
+                1.0,
+                "12 of 12 verified",
+            ),
+            (
+                "Mock ingest complete. 12/12 verified. No failures.",
+                1.0,
+                1.0,
+                "Complete",
+            ),
         ];
         for (text, pct, vpct, plabel) in steps {
             let t = text.to_string();

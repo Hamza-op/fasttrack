@@ -23,16 +23,12 @@ impl MediaType {
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_ascii_lowercase().as_str() {
             "arw" | "sr2" | "srf" | "cr2" | "cr3" | "crw" | "nef" | "nrw" | "raf" | "dng"
-            | "rw2" | "orf" | "pef" | "srw" | "iiq" => {
-                Some(Self::PhotoRaw)
-            }
-            "jpg" | "jpeg" | "jpe" | "hif" | "heif" | "heic" | "tiff" | "tif" => {
+            | "rw2" | "orf" | "pef" | "srw" | "iiq" => Some(Self::PhotoRaw),
+            "jpg" | "jpeg" | "jpe" | "png" | "hif" | "heif" | "heic" | "tiff" | "tif" => {
                 Some(Self::PhotoJpg)
             }
             "mp4" | "mov" | "mxf" | "avi" | "mts" | "m2ts" | "mpg" | "mpeg" | "crm" | "m4v"
-            | "3gp" | "3g2" => {
-                Some(Self::Video)
-            }
+            | "3gp" | "3g2" => Some(Self::Video),
             "wav" | "mp3" | "bwf" | "aac" | "m4a" => Some(Self::Audio),
             _ => None,
         }
@@ -46,7 +42,6 @@ impl MediaType {
             Self::Audio => "audio",
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +120,7 @@ pub enum LockMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(dead_code)]
 pub struct CameraMetadata {
     pub make: Option<String>,
     pub model: Option<String>,
@@ -162,7 +158,7 @@ pub struct ScanSummary {
 impl ScanSummary {
     pub fn summary_text(&self) -> String {
         format!(
-            "{} {} files · RAW {} · JPG {} · Video {} · Audio {} · {}",
+            "{} {} files · RAW {} · JPG/PNG {} · Video {} · Audio {} · {}",
             self.manufacturer,
             self.total_files,
             self.raw_count,
@@ -180,6 +176,7 @@ pub struct SessionRequest {
     pub client_name: String,
     pub event_name: String,
     pub camera_label_override: Option<String>,
+    pub skip_already_copied: bool,
     pub base_path: PathBuf,
     pub scan: ScanSummary,
 }
@@ -214,6 +211,7 @@ pub struct DuplicateRecord {
     pub event_name: String,
     pub status: FileStatus,
     pub xxh3_hash: Option<String>,
+    pub dest_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -332,7 +330,10 @@ pub fn enforce_path_limit(path: &Path) -> Result<(), MoonError> {
 
 pub fn next_event_suggestion(completed_events: &[String]) -> String {
     for event in EVENT_SEQUENCE {
-        if !completed_events.iter().any(|item| item.eq_ignore_ascii_case(event)) {
+        if !completed_events
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case(event))
+        {
             return event.to_string();
         }
     }
@@ -388,9 +389,13 @@ mod tests {
             "Barat"
         );
         assert_eq!(
-            next_event_suggestion(
-                &["Ubtan".into(), "Mehndi".into(), "Barat".into(), "Walima".into(), "Portraits".into()]
-            ),
+            next_event_suggestion(&[
+                "Ubtan".into(),
+                "Mehndi".into(),
+                "Barat".into(),
+                "Walima".into(),
+                "Portraits".into()
+            ]),
             "Custom..."
         );
     }

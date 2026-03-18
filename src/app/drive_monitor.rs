@@ -18,6 +18,7 @@ pub struct DetectedDrive {
     pub root: PathBuf,
     pub label: String,
     pub free_bytes: u64,
+    pub is_removable: bool,
 }
 
 pub fn detect_drives() -> Result<Vec<DetectedDrive>> {
@@ -39,12 +40,14 @@ pub fn detect_drives() -> Result<Vec<DetectedDrive>> {
                 .collect();
             let drive_type = unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) };
             let has_camera_signature = root.join("DCIM").exists() || root.join("PRIVATE").exists();
-            if drive_type != DRIVE_REMOVABLE && (drive_type != DRIVE_FIXED || !has_camera_signature) {
+            if drive_type != DRIVE_REMOVABLE && (drive_type != DRIVE_FIXED || !has_camera_signature)
+            {
                 continue;
             }
 
             drives.push(DetectedDrive {
                 free_bytes: available_space(&root).unwrap_or_default(),
+                is_removable: drive_type == DRIVE_REMOVABLE,
                 label: root.display().to_string(),
                 root,
             });
@@ -59,9 +62,14 @@ pub fn detect_drives() -> Result<Vec<DetectedDrive>> {
         if let Ok(entries) = std::fs::read_dir("/Volumes") {
             for entry in entries.flatten() {
                 let root = entry.path();
-                let label = root.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let label = root
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 drives.push(DetectedDrive {
                     free_bytes: available_space(&root).unwrap_or_default(),
+                    is_removable: true,
                     label: root.display().to_string(),
                     root,
                 });
@@ -84,9 +92,14 @@ pub fn detect_drives() -> Result<Vec<DetectedDrive>> {
             if let Ok(entries) = std::fs::read_dir(&base) {
                 for entry in entries.flatten() {
                     let root = entry.path();
-                    let label = root.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    let label = root
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
                     drives.push(DetectedDrive {
                         free_bytes: available_space(&root).unwrap_or_default(),
+                        is_removable: true,
                         label: root.display().to_string(),
                         root,
                     });

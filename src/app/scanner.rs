@@ -1,6 +1,10 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -8,14 +12,29 @@ use chrono::{DateTime, Utc};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::app::errors::MoonError;
-use crate::app::metadata::detect_camera_metadata;
 use crate::app::types::{MediaType, ScanSummary, ScannedFile};
 
 const SKIP_DIRS: &[&str] = &["THMBNL", "MISC", "CANONMSC", "BACKUP"];
 const SKIP_FILES: &[&str] = &["MEDIAPRO.XML", "STATUS.BIN", "AESSION.BIN", "INDEX.BDM"];
-const SKIP_EXTS: &[&str] = &["xml", "bim", "dat", "ctg", "thm", "tid", "ind", "bdm", "cpi", "mpl"];
+const SKIP_EXTS: &[&str] = &[
+    "xml", "bim", "dat", "ctg", "thm", "tid", "ind", "bdm", "cpi", "mpl",
+];
 
-pub fn scan_drive(root: &Path, include_proxy_files: bool, skip_hidden: bool) -> Result<ScanSummary> {
+#[allow(dead_code)]
+pub fn scan_drive(
+    root: &Path,
+    include_proxy_files: bool,
+    skip_hidden: bool,
+) -> Result<ScanSummary> {
+    scan_drive_with_cancel(root, include_proxy_files, skip_hidden, None)
+}
+
+pub fn scan_drive_with_cancel(
+    root: &Path,
+    include_proxy_files: bool,
+    skip_hidden: bool,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<ScanSummary> {
     if !root.exists() {
         return Err(MoonError::NoMediaFound {
             drive: root.display().to_string(),
@@ -31,6 +50,13 @@ pub fn scan_drive(root: &Path, include_proxy_files: bool, skip_hidden: bool) -> 
 
     let walker = WalkDir::new(root).into_iter();
     for entry in walker.filter_entry(|entry| should_enter(entry, include_proxy_files)) {
+        if cancel_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(MoonError::ScanCancelled.into());
+        }
+
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -51,7 +77,10 @@ pub fn scan_drive(root: &Path, include_proxy_files: bool, skip_hidden: bool) -> 
             continue;
         };
 
-        if SKIP_FILES.iter().any(|value| value.eq_ignore_ascii_case(filename)) {
+        if SKIP_FILES
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(filename))
+        {
             skipped_count += 1;
             continue;
         }
@@ -72,24 +101,22 @@ pub fn scan_drive(root: &Path, include_proxy_files: bool, skip_hidden: bool) -> 
             continue;
         };
 
-        let relative_source_path = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_path_buf();
+        let relative_source_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
 
         if !manufacturer_profile.accepts_path(&relative_source_path, &ext, include_proxy_files) {
             skipped_count += 1;
             continue;
         }
 
-        let metadata = fs::metadata(path).with_context(|| format!("unable to read {}", path.display()))?;
+        let metadata =
+            fs::metadata(path).with_context(|| format!("unable to read {}", path.display()))?;
         if metadata.len() == 0 {
             skipped_count += 1;
             continue;
         }
 
-        let camera = detect_camera_metadata(path);
-        let source_modified = file_time_string(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        let source_modified =
+            file_time_string(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH));
         let source_created = file_time_string(
             metadata
                 .created()
@@ -105,8 +132,9 @@ pub fn scan_drive(root: &Path, include_proxy_files: bool, skip_hidden: bool) -> 
             source_modified,
             source_created,
             media_type,
-            camera_model: camera.model,
-            camera_serial: camera.serial_number,
+            // Fast scan mode only inventories files; deeper metadata extraction is deferred.
+            camera_model: None,
+            camera_serial: None,
         });
         total_size += metadata.len();
     }
@@ -156,7 +184,9 @@ fn should_enter(entry: &DirEntry, include_proxy_files: bool) -> bool {
     if !include_proxy_files && name.eq_ignore_ascii_case("SUB") {
         return false;
     }
-    !SKIP_DIRS.iter().any(|value| name.eq_ignore_ascii_case(value))
+    !SKIP_DIRS
+        .iter()
+        .any(|value| name.eq_ignore_ascii_case(value))
 }
 
 pub fn detect_manufacturer(root: &Path) -> String {
@@ -217,7 +247,10 @@ impl ManufacturerProfile {
             .components()
             .map(|component| component.as_os_str().to_string_lossy().to_ascii_uppercase())
             .collect::<Vec<_>>();
-        let root = parts_upper.first().map(|value| value.as_str()).unwrap_or_default();
+        let root = parts_upper
+            .first()
+            .map(|value| value.as_str())
+            .unwrap_or_default();
 
         match self {
             Self::Sony => {
@@ -231,7 +264,10 @@ impl ManufacturerProfile {
                     if parts_upper.iter().any(|part| part == "SUB") && !include_proxy_files {
                         return false;
                     }
-                    if parts_upper.iter().any(|part| part == "CLIP" || part == "STREAM") {
+                    if parts_upper
+                        .iter()
+                        .any(|part| part == "CLIP" || part == "STREAM")
+                    {
                         return Self::is_video_extension(ext);
                     }
                     return true;
@@ -240,7 +276,10 @@ impl ManufacturerProfile {
             }
             Self::Canon => {
                 if root == "DCIM" {
-                    return true;
+                    return parts_upper
+                        .get(1)
+                        .map(|part| part.contains("CANON"))
+                        .unwrap_or(false);
                 }
                 if root == "PRIVATE"
                     && parts_upper.len() >= 4
@@ -258,9 +297,7 @@ impl ManufacturerProfile {
                 }
                 false
             }
-            Self::Nikon => {
-                root == "DCIM"
-            }
+            Self::Nikon => root == "DCIM",
             Self::Generic => true,
         }
     }
@@ -268,8 +305,18 @@ impl ManufacturerProfile {
     fn is_video_extension(ext: &str) -> bool {
         matches!(
             ext,
-            "mp4" | "mov" | "mxf" | "avi" | "mts" | "m2ts" | "mpg" | "mpeg" | "crm" | "m4v"
-                | "3gp" | "3g2"
+            "mp4"
+                | "mov"
+                | "mxf"
+                | "avi"
+                | "mts"
+                | "m2ts"
+                | "mpg"
+                | "mpeg"
+                | "crm"
+                | "m4v"
+                | "3gp"
+                | "3g2"
         )
     }
 }
@@ -305,7 +352,11 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{detect_manufacturer, scan_drive};
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    use super::{detect_manufacturer, scan_drive, scan_drive_with_cancel};
+    use crate::app::errors::MoonError;
+    use crate::app::types::MediaType;
 
     #[test]
     fn detects_manufacturer_from_layout() {
@@ -325,6 +376,8 @@ mod tests {
         assert_eq!(summary.total_files, 1);
         assert_eq!(summary.raw_count, 1);
         assert_eq!(summary.skipped_count, 1);
+        assert!(summary.files[0].camera_model.is_none());
+        assert!(summary.files[0].camera_serial.is_none());
     }
 
     #[test]
@@ -354,5 +407,47 @@ mod tests {
 
         let summary = scan_drive(temp.path(), false, false).unwrap();
         assert_eq!(summary.total_files, 1);
+    }
+
+    #[test]
+    fn png_files_are_scanned_as_photo_jpg() {
+        let temp = tempdir().unwrap();
+        let clip = temp.path().join("DCIM").join("100MSDCF");
+        fs::create_dir_all(&clip).unwrap();
+        fs::write(clip.join("A001.PNG"), b"png").unwrap();
+
+        let summary = scan_drive(temp.path(), false, false).unwrap();
+        assert_eq!(summary.total_files, 1);
+        assert_eq!(summary.jpg_count, 1);
+        assert_eq!(summary.files[0].media_type, MediaType::PhotoJpg);
+    }
+
+    #[test]
+    fn jpg_and_png_share_the_same_still_bucket() {
+        let temp = tempdir().unwrap();
+        let clip = temp.path().join("DCIM").join("100MSDCF");
+        fs::create_dir_all(&clip).unwrap();
+        fs::write(clip.join("A001.JPG"), b"jpg").unwrap();
+        fs::write(clip.join("A002.PNG"), b"png").unwrap();
+
+        let summary = scan_drive(temp.path(), false, false).unwrap();
+        assert_eq!(summary.total_files, 2);
+        assert_eq!(summary.jpg_count, 2);
+    }
+
+    #[test]
+    fn scan_cancellation_stops_the_walk() {
+        let temp = tempdir().unwrap();
+        let clip = temp.path().join("DCIM").join("100MSDCF");
+        fs::create_dir_all(&clip).unwrap();
+        fs::write(clip.join("A001.JPG"), b"jpg").unwrap();
+
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let error = scan_drive_with_cancel(temp.path(), false, false, Some(cancel_flag))
+            .expect_err("scan should cancel");
+        let scan_error = error
+            .downcast_ref::<MoonError>()
+            .expect("moon error");
+        assert!(matches!(scan_error, MoonError::ScanCancelled));
     }
 }
