@@ -20,7 +20,8 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::app::db::Database;
 use crate::app::errors::MoonError;
 use crate::app::lock::{
-    apply_readonly_recursive, hide_manifest, mark_folder_system, protect_folder_from_delete,
+    apply_readonly_recursive, clear_readonly_recursive, hide_manifest, mark_folder_system,
+    prepare_manifest_for_write, protect_folder_from_delete,
 };
 use crate::app::manifest::{write_manifest, Manifest};
 use crate::app::settings::{AppPaths, Settings};
@@ -116,30 +117,41 @@ impl IngestEngine {
                 .into());
             }
 
+            let tracked_record = existing.get(&file.source_path);
+            let reuse_tracked_destination = tracked_record
+                .is_some_and(|record| tracked_record_matches_file(record, file));
+            if let Some(record) = tracked_record {
+                if matches!(record.status, FileStatus::Verified) && record.dest_path.exists() {
+                    if reuse_tracked_destination {
+                        verified_files += 1;
+                        bytes_done += file.size_bytes;
+                        on_progress(IngestProgress {
+                            message: format!("Skipping already verified {}", file.filename),
+                            files_done: verified_files + failed_files + skipped_files,
+                            total_files,
+                            bytes_done,
+                            total_bytes,
+                        });
+                        continue;
+                    }
+
+                    warnings.push(format!(
+                        "Tracked file {} changed since the previous ingest record. Copying it as a new file.",
+                        file.filename
+                    ));
+                }
+            }
+
             let destination = self.resolve_destination(
                 &preflight.destination_root,
                 file,
                 &existing,
+                reuse_tracked_destination,
                 camera_folder.as_deref(),
                 split_photo_folders,
             )?;
             self.db
                 .ensure_file_row(event_id, file, &destination, FileStatus::Pending)?;
-
-            if let Some(record) = existing.get(&file.source_path) {
-                if matches!(record.status, FileStatus::Verified) && record.dest_path.exists() {
-                    verified_files += 1;
-                    bytes_done += file.size_bytes;
-                    on_progress(IngestProgress {
-                        message: format!("Skipping already verified {}", file.filename),
-                        files_done: verified_files + failed_files + skipped_files,
-                        total_files,
-                        bytes_done,
-                        total_bytes,
-                    });
-                    continue;
-                }
-            }
 
             let duplicate_candidates = self
                 .db
@@ -357,7 +369,19 @@ impl IngestEngine {
             manifest_records,
             locked,
         );
-        let manifest_path = write_manifest(&preflight.destination_root, &manifest)?;
+        let manifest_path = preflight.destination_root.join(".mooningest_manifest.json");
+        prepare_manifest_for_write(&manifest_path).with_context(|| {
+            format!(
+                "Could not reopen manifest at '{}'.",
+                manifest_path.display()
+            )
+        })?;
+        let manifest_path = write_manifest(&preflight.destination_root, &manifest).with_context(|| {
+            format!(
+                "Could not write manifest in '{}'.",
+                preflight.destination_root.display()
+            )
+        })?;
         let _ = hide_manifest(&manifest_path);
         info!("wrote manifest {}", manifest_path.display());
 
@@ -405,6 +429,7 @@ impl IngestEngine {
     ) -> Result<PreflightResult> {
         validate_folder_name(&request.client_name, 100)?;
         validate_folder_name(&request.event_name, 100)?;
+        let mut warnings = Vec::new();
 
         let destination_root = request
             .base_path
@@ -431,7 +456,39 @@ impl IngestEngine {
             )
         })?;
 
-        std::fs::create_dir_all(&destination_root)?;
+        std::fs::create_dir_all(&destination_root).with_context(|| {
+            format!(
+                "Could not prepare destination folder '{}'.",
+                destination_root.display()
+            )
+        })?;
+
+        if let Some(existing_event) = self
+            .db
+            .latest_event_for_client_event(&request.client_name, &request.event_name)?
+        {
+            if existing_event.locked
+                && same_path(&existing_event.destination_path, &destination_root)
+                && destination_root.exists()
+            {
+                let unlock_errors = clear_readonly_recursive(&destination_root);
+                if unlock_errors.is_empty() {
+                    warnings.push(
+                        "Existing locked event folder was reopened so new files can be added."
+                            .into(),
+                    );
+                } else {
+                    for (path, error) in unlock_errors {
+                        warnings.push(format!(
+                            "Could not fully reopen {} before ingest: {}",
+                            path.display(),
+                            error
+                        ));
+                    }
+                }
+            }
+        }
+
         let probe = destination_root.join(".moon_write_probe.tmp");
         std::fs::write(&probe, b"probe").with_context(|| {
             format!(
@@ -469,7 +526,6 @@ impl IngestEngine {
             enforce_path_limit(&planned)?;
         }
 
-        let mut warnings = Vec::new();
         if self.settings.safety.auto_lock_on_complete {
             match self.settings.safety.lock_mode {
                 LockMode::None => warnings.push(
@@ -503,11 +559,14 @@ impl IngestEngine {
         event_root: &Path,
         file: &ScannedFile,
         existing: &HashMap<PathBuf, StoredFileRecord>,
+        reuse_tracked_destination: bool,
         camera_folder: Option<&str>,
         split_photo_folders: bool,
     ) -> Result<PathBuf> {
-        if let Some(record) = existing.get(&file.source_path) {
-            return Ok(record.dest_path.clone());
+        if reuse_tracked_destination {
+            if let Some(record) = existing.get(&file.source_path) {
+                return Ok(record.dest_path.clone());
+            }
         }
 
         let (media_root, maybe_subdir) = Self::route_segments_for_file(file, split_photo_folders);
@@ -595,7 +654,12 @@ impl IngestEngine {
             created_at: Utc::now().to_rfc3339(),
         };
         let payload = serde_json::to_string_pretty(&lock)?;
-        std::fs::write(&self.paths.lock_file, payload)?;
+        std::fs::write(&self.paths.lock_file, payload).with_context(|| {
+            format!(
+                "Could not create session lock at '{}'.",
+                self.paths.lock_file.display()
+            )
+        })?;
         Ok(SessionLockGuard {
             path: self.paths.lock_file.clone(),
         })
@@ -841,6 +905,24 @@ async fn hash_file(path: &Path, buffer_size: usize) -> Result<String> {
     Ok(format!("{:032x}", hasher.digest128()))
 }
 
+fn tracked_record_matches_file(record: &StoredFileRecord, file: &ScannedFile) -> bool {
+    record.size_bytes == file.size_bytes
+        && record.source_created == file.source_created
+        && record.source_modified == file.source_modified
+        && record.media_type == file.media_type
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.display().to_string().eq_ignore_ascii_case(&right.display().to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 async fn hash_file_partial(path: &Path) -> Result<String> {
     let mut file = File::open(path).await?;
     let file_len = file.metadata().await?.len();
@@ -884,7 +966,7 @@ mod tests {
     use crate::app::manifest::Manifest;
     use crate::app::scanner::scan_drive;
     use crate::app::settings::{AppPaths, Settings};
-    use crate::app::types::{MediaType, ScanSummary, ScannedFile, SessionRequest};
+    use crate::app::types::{LockMode, MediaType, ScanSummary, ScannedFile, SessionRequest};
 
     use super::IngestEngine;
 
@@ -990,6 +1072,399 @@ mod tests {
         let events = db.recent_events(1).expect("events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_name, "Barat");
+    }
+
+    #[test]
+    fn locked_event_can_accept_more_files_with_attribute_lock() {
+        let temp = tempdir().expect("temp dir");
+        let source_one = temp.path().join("card_one");
+        let source_two = temp.path().join("card_two");
+        let base = temp.path().join("dest");
+        fs::create_dir_all(&source_one).expect("create source one");
+        fs::create_dir_all(&source_two).expect("create source two");
+        fs::create_dir_all(&base).expect("create base");
+
+        let src_one = source_one.join("A001.ARW");
+        let src_two = source_two.join("A002.ARW");
+        fs::write(&src_one, b"rawdata-one").expect("write first source file");
+        fs::write(&src_two, b"rawdata-two").expect("write second source file");
+
+        let file_one = make_scanned_file(&src_one, MediaType::PhotoRaw);
+        let file_two = make_scanned_file(&src_two, MediaType::PhotoRaw);
+        let summary_one = ScanSummary {
+            manufacturer: "Sony".into(),
+            drive_root: source_one.clone(),
+            card_label: Some(source_one.display().to_string()),
+            total_size_bytes: file_one.size_bytes,
+            total_files: 1,
+            raw_count: 1,
+            jpg_count: 0,
+            video_count: 0,
+            audio_count: 0,
+            skipped_count: 0,
+            files: vec![file_one],
+        };
+        let summary_two = ScanSummary {
+            manufacturer: "Sony".into(),
+            drive_root: source_two.clone(),
+            card_label: Some(source_two.display().to_string()),
+            total_size_bytes: file_two.size_bytes,
+            total_files: 1,
+            raw_count: 1,
+            jpg_count: 0,
+            video_count: 0,
+            audio_count: 0,
+            skipped_count: 0,
+            files: vec![file_two],
+        };
+
+        let paths = test_paths(temp.path());
+        paths.ensure().expect("ensure paths");
+        let db = Database::open(&paths).expect("db open");
+        let mut settings = make_settings(&base);
+        settings.safety.auto_lock_on_complete = true;
+        settings.safety.lock_mode = LockMode::Attribute;
+        let engine = IngestEngine::new(db, settings, paths);
+
+        let request_one = SessionRequest {
+            source_drive: source_one.clone(),
+            client_name: "Client Lock".into(),
+            event_name: "Barat".into(),
+            camera_label_override: None,
+            skip_already_copied: false,
+            base_path: base.clone(),
+            scan: summary_one,
+        };
+        let request_two = SessionRequest {
+            source_drive: source_two.clone(),
+            client_name: "Client Lock".into(),
+            event_name: "Barat".into(),
+            camera_label_override: None,
+            skip_already_copied: false,
+            base_path: base.clone(),
+            scan: summary_two,
+        };
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(engine.run_session(request_one, Arc::new(AtomicBool::new(false)), |_| {}))
+            .expect("first run session");
+        let second = runtime
+            .block_on(engine.run_session(request_two, Arc::new(AtomicBool::new(false)), |_| {}));
+
+        assert!(
+            second.is_ok(),
+            "locked event should accept new files, got {second:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_event_can_accept_more_files_with_acl_lock() {
+        let temp = tempdir().expect("temp dir");
+        let source_one = temp.path().join("card_one");
+        let source_two = temp.path().join("card_two");
+        let base = temp.path().join("dest");
+        fs::create_dir_all(&source_one).expect("create source one");
+        fs::create_dir_all(&source_two).expect("create source two");
+        fs::create_dir_all(&base).expect("create base");
+
+        let src_one = source_one.join("A001.ARW");
+        let src_two = source_two.join("A002.ARW");
+        fs::write(&src_one, b"rawdata-one").expect("write first source file");
+        fs::write(&src_two, b"rawdata-two").expect("write second source file");
+
+        let file_one = make_scanned_file(&src_one, MediaType::PhotoRaw);
+        let file_two = make_scanned_file(&src_two, MediaType::PhotoRaw);
+        let summary_one = ScanSummary {
+            manufacturer: "Sony".into(),
+            drive_root: source_one.clone(),
+            card_label: Some(source_one.display().to_string()),
+            total_size_bytes: file_one.size_bytes,
+            total_files: 1,
+            raw_count: 1,
+            jpg_count: 0,
+            video_count: 0,
+            audio_count: 0,
+            skipped_count: 0,
+            files: vec![file_one],
+        };
+        let summary_two = ScanSummary {
+            manufacturer: "Sony".into(),
+            drive_root: source_two.clone(),
+            card_label: Some(source_two.display().to_string()),
+            total_size_bytes: file_two.size_bytes,
+            total_files: 1,
+            raw_count: 1,
+            jpg_count: 0,
+            video_count: 0,
+            audio_count: 0,
+            skipped_count: 0,
+            files: vec![file_two],
+        };
+
+        let paths = test_paths(temp.path());
+        paths.ensure().expect("ensure paths");
+        let db = Database::open(&paths).expect("db open");
+        let mut settings = make_settings(&base);
+        settings.safety.auto_lock_on_complete = true;
+        settings.safety.lock_mode = LockMode::Acl;
+        let engine = IngestEngine::new(db, settings, paths);
+
+        let request_one = SessionRequest {
+            source_drive: source_one.clone(),
+            client_name: "Client Lock".into(),
+            event_name: "Barat".into(),
+            camera_label_override: None,
+            skip_already_copied: false,
+            base_path: base.clone(),
+            scan: summary_one,
+        };
+        let request_two = SessionRequest {
+            source_drive: source_two.clone(),
+            client_name: "Client Lock".into(),
+            event_name: "Barat".into(),
+            camera_label_override: None,
+            skip_already_copied: false,
+            base_path: base.clone(),
+            scan: summary_two,
+        };
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(engine.run_session(request_one, Arc::new(AtomicBool::new(false)), |_| {}))
+            .expect("first run session");
+        let second = runtime
+            .block_on(engine.run_session(request_two, Arc::new(AtomicBool::new(false)), |_| {}));
+
+        assert!(
+            second.is_ok(),
+            "ACL locked event should accept new files, got {second:?}"
+        );
+    }
+
+    #[test]
+    fn changed_file_at_same_source_path_is_copied_as_new_variant() {
+        let temp = tempdir().expect("temp dir");
+        let source = temp.path().join("card");
+        let base = temp.path().join("dest");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&base).expect("create base");
+
+        let src = source.join("A001.ARW");
+        fs::write(&src, b"rawdata-new-version").expect("write source file");
+
+        let mut file = make_scanned_file(&src, MediaType::PhotoRaw);
+        file.size_bytes = 19;
+        file.source_modified = "2026-01-02T00:00:00Z".into();
+
+        let summary = ScanSummary {
+            manufacturer: "Sony".into(),
+            drive_root: source.clone(),
+            card_label: Some(source.display().to_string()),
+            total_size_bytes: file.size_bytes,
+            total_files: 1,
+            raw_count: 1,
+            jpg_count: 0,
+            video_count: 0,
+            audio_count: 0,
+            skipped_count: 0,
+            files: vec![file.clone()],
+        };
+
+        let paths = test_paths(temp.path());
+        paths.ensure().expect("ensure paths");
+        let db = Database::open(&paths).expect("db open");
+        let settings = make_settings(&base);
+        let engine = IngestEngine::new(db.clone(), settings, paths);
+
+        let client_id = db
+            .upsert_client("Client Nine", &base, None)
+            .expect("upsert client");
+        let event_root = base.join("Client Nine").join("Barat");
+        let event_id = db
+            .prepare_event(client_id, "Barat", &event_root)
+            .expect("prepare event");
+        let old_dest = event_root.join("Photos").join("A001.ARW");
+        if let Some(parent) = old_dest.parent() {
+            fs::create_dir_all(parent).expect("create destination parent");
+        }
+        fs::write(&old_dest, b"rawdata-old").expect("write old destination");
+
+        let mut old_file = file.clone();
+        old_file.size_bytes = 11;
+        old_file.source_modified = "2026-01-01T00:00:00Z".into();
+        db.ensure_file_row(
+            event_id,
+            &old_file,
+            &old_dest,
+            crate::app::types::FileStatus::Pending,
+        )
+        .expect("seed old file row");
+        db.update_file_status(
+            event_id,
+            &old_file.source_path,
+            &old_dest,
+            crate::app::types::FileStatus::Verified,
+            Some("hash-old"),
+            None,
+        )
+        .expect("seed verified old file");
+
+        let request = SessionRequest {
+            source_drive: source.clone(),
+            client_name: "Client Nine".into(),
+            event_name: "Barat".into(),
+            camera_label_override: None,
+            skip_already_copied: false,
+            base_path: base.clone(),
+            scan: summary,
+        };
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let report = runtime
+            .block_on(engine.run_session(request, Arc::new(AtomicBool::new(false)), |_| {}))
+            .expect("run session");
+
+        let new_dest = event_root.join("Photos").join("A001_1.ARW");
+        let fallback_dest = event_root.join("Photos").join("A001_001.ARW");
+        assert_eq!(report.verified_files, 1);
+        assert!(
+            new_dest.exists() || fallback_dest.exists(),
+            "expected changed file to be copied as a new variant"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("changed since the previous ingest record")),
+            "expected warning about changed tracked file"
+        );
+    }
+
+    #[test]
+    fn camera_override_routes_new_media_into_cam2_subfolders() {
+        let temp = tempdir().expect("temp dir");
+        let source = temp.path().join("card");
+        let old_source = temp.path().join("old_card");
+        let base = temp.path().join("dest");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&old_source).expect("create old source");
+        fs::create_dir_all(&base).expect("create base");
+
+        let photo_src = source.join("A001.JPG");
+        let video_src = source.join("C001.MP4");
+        let old_src = old_source.join("OLD001.ARW");
+        fs::write(&photo_src, b"jpgdata").expect("write photo source");
+        fs::write(&video_src, b"videodata").expect("write video source");
+        fs::write(&old_src, b"oldraw").expect("write old source");
+
+        let photo = make_scanned_file(&photo_src, MediaType::PhotoJpg);
+        let video = make_scanned_file(&video_src, MediaType::Video);
+        let old_file = make_scanned_file(&old_src, MediaType::PhotoRaw);
+        let summary = ScanSummary {
+            manufacturer: "Sony".into(),
+            drive_root: source.clone(),
+            card_label: Some(source.display().to_string()),
+            total_size_bytes: photo.size_bytes + video.size_bytes,
+            total_files: 2,
+            raw_count: 0,
+            jpg_count: 1,
+            video_count: 1,
+            audio_count: 0,
+            skipped_count: 0,
+            files: vec![photo.clone(), video.clone()],
+        };
+
+        let paths = test_paths(temp.path());
+        paths.ensure().expect("ensure paths");
+        let db = Database::open(&paths).expect("db open");
+        let settings = make_settings(&base);
+        let engine = IngestEngine::new(db.clone(), settings, paths);
+
+        let client_id = db
+            .upsert_client("Client Ten", &base, None)
+            .expect("upsert client");
+        let existing_event_root = base.join("Client Ten").join("Barat");
+        let existing_event_id = db
+            .prepare_event(client_id, "Barat", &existing_event_root)
+            .expect("prepare event");
+        let old_dest = existing_event_root.join("Photos").join("OLD001.ARW");
+        if let Some(parent) = old_dest.parent() {
+            fs::create_dir_all(parent).expect("create old destination parent");
+        }
+        fs::write(&old_dest, b"oldraw").expect("write old destination");
+        db.ensure_file_row(
+            existing_event_id,
+            &old_file,
+            &old_dest,
+            crate::app::types::FileStatus::Pending,
+        )
+        .expect("seed old file row");
+        db.update_file_status(
+            existing_event_id,
+            &old_file.source_path,
+            &old_dest,
+            crate::app::types::FileStatus::Verified,
+            Some("hash-old"),
+            None,
+        )
+        .expect("seed verified old file");
+        db.mark_event(
+            existing_event_id,
+            crate::app::types::EventStatus::Completed,
+            &existing_event_root,
+            1,
+            0,
+            1,
+            old_file.size_bytes,
+            false,
+        )
+        .expect("complete previous event");
+
+        let request = SessionRequest {
+            source_drive: source.clone(),
+            client_name: "Client Ten".into(),
+            event_name: "Barat".into(),
+            camera_label_override: Some("Cam 2".into()),
+            skip_already_copied: false,
+            base_path: base.clone(),
+            scan: summary,
+        };
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(engine.run_session(request, Arc::new(AtomicBool::new(false)), |_| {}))
+            .expect("run session");
+
+        assert!(
+            existing_event_root
+                .join("Photos")
+                .join("Cam 2")
+                .join("A001.JPG")
+                .exists(),
+            "expected photo in Photos/Cam 2"
+        );
+        assert!(
+            existing_event_root
+                .join("Videos")
+                .join("Cam 2")
+                .join("C001.MP4")
+                .exists(),
+            "expected video in Videos/Cam 2"
+        );
     }
 
     #[test]

@@ -24,8 +24,8 @@ use windows::Win32::Security::{
 };
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{
-    SetFileAttributesW, DELETE, FILE_ATTRIBUTE_SYSTEM, FILE_DELETE_CHILD,
-    FILE_FLAGS_AND_ATTRIBUTES,
+    SetFileAttributesW, DELETE, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY,
+    FILE_ATTRIBUTE_SYSTEM, FILE_DELETE_CHILD, FILE_FLAGS_AND_ATTRIBUTES,
 };
 
 use crate::app::errors::MoonError;
@@ -40,7 +40,7 @@ pub fn apply_readonly_recursive(root: &Path) -> Vec<(PathBuf, MoonError)> {
     entries.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
 
     for entry in entries {
-        if let Err(error) = set_readonly(&entry) {
+        if let Err(error) = set_readonly_state(&entry, true) {
             errors.push((entry, error));
         }
     }
@@ -48,13 +48,31 @@ pub fn apply_readonly_recursive(root: &Path) -> Vec<(PathBuf, MoonError)> {
     errors
 }
 
-fn set_readonly(path: &Path) -> Result<(), MoonError> {
+pub fn clear_readonly_recursive(root: &Path) -> Vec<(PathBuf, MoonError)> {
+    let mut errors = Vec::new();
+    let mut entries: Vec<PathBuf> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    entries.sort_by_key(|path| path.components().count());
+
+    for entry in entries {
+        if let Err(error) = set_readonly_state(&entry, false) {
+            errors.push((entry, error));
+        }
+    }
+
+    errors
+}
+
+fn set_readonly_state(path: &Path, readonly: bool) -> Result<(), MoonError> {
     let metadata = fs::metadata(path).map_err(|source| MoonError::AttributeError {
         path: path.to_path_buf(),
         source,
     })?;
     let mut permissions = metadata.permissions();
-    permissions.set_readonly(true);
+    permissions.set_readonly(readonly);
     fs::set_permissions(path, permissions).map_err(|source| MoonError::AttributeError {
         path: path.to_path_buf(),
         source,
@@ -79,6 +97,35 @@ pub fn hide_manifest(path: &Path) -> Result<()> {
 
 #[cfg(not(windows))]
 pub fn hide_manifest(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn prepare_manifest_for_write(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)?;
+
+    let attrs = metadata.file_attributes()
+        & !(FILE_ATTRIBUTE_READONLY.0 | FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM.0);
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(attrs))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn prepare_manifest_for_write(_path: &Path) -> Result<()> {
     Ok(())
 }
 

@@ -42,6 +42,15 @@ impl MediaType {
             Self::Audio => "audio",
         }
     }
+
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "photo_raw" => Self::PhotoRaw,
+            "video" => Self::Video,
+            "audio" => Self::Audio,
+            _ => Self::PhotoJpg,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,6 +229,10 @@ pub struct StoredFileRecord {
     pub dest_path: PathBuf,
     pub status: FileStatus,
     pub hash: Option<String>,
+    pub size_bytes: u64,
+    pub source_modified: String,
+    pub source_created: String,
+    pub media_type: MediaType,
 }
 
 #[derive(Debug, Clone)]

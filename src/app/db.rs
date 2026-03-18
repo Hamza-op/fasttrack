@@ -10,7 +10,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::app::settings::AppPaths;
 use crate::app::types::{
     next_event_suggestion, ClientSummary, DuplicateRecord, EventOption, EventStatus,
-    FileRecordSummary, FileStatus, HistoryEvent, ResumableEvent, ScannedFile, StoredFileRecord,
+    FileRecordSummary, FileStatus, HistoryEvent, MediaType, ResumableEvent, ScannedFile,
+    StoredFileRecord,
 };
 
 const SCHEMA_VERSION: &str = "1";
@@ -722,7 +723,7 @@ impl Database {
     pub fn load_event_files(&self, event_id: i64) -> Result<HashMap<PathBuf, StoredFileRecord>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT source_path, dest_path, status, xxh3_hash FROM files WHERE event_id = ?1",
+                "SELECT source_path, dest_path, status, xxh3_hash, size_bytes, source_modified, source_created, media_type FROM files WHERE event_id = ?1",
             )?;
             let rows = statement.query_map(params![event_id], |row| {
                 Ok((
@@ -731,6 +732,10 @@ impl Database {
                         dest_path: PathBuf::from(row.get::<_, String>(1)?),
                         status: FileStatus::from_db(&row.get::<_, String>(2)?),
                         hash: row.get(3)?,
+                        size_bytes: row.get::<_, i64>(4)? as u64,
+                        source_modified: row.get(5)?,
+                        source_created: row.get(6)?,
+                        media_type: MediaType::from_db(&row.get::<_, String>(7)?),
                     },
                 ))
             })?;
