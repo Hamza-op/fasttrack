@@ -580,7 +580,7 @@ impl IngestEngine {
         }
         std::fs::create_dir_all(&destination)?;
 
-        let resolved = unique_destination(destination.join(&file.filename));
+        let resolved = unique_destination(destination.join(&file.filename))?;
         enforce_path_limit(&resolved)?;
         Ok(resolved)
     }
@@ -745,9 +745,9 @@ impl Drop for SessionLockGuard {
     }
 }
 
-fn unique_destination(path: PathBuf) -> PathBuf {
+fn unique_destination(path: PathBuf) -> Result<PathBuf> {
     if !path.exists() {
-        return path;
+        return Ok(path);
     }
 
     let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -760,18 +760,18 @@ fn unique_destination(path: PathBuf) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("");
 
-    for index in 1..1000 {
+    for index in 1..10000 {
         let candidate = if extension.is_empty() {
             parent.join(format!("{stem}_{index}"))
         } else {
             parent.join(format!("{stem}_{index}.{extension}"))
         };
         if !candidate.exists() {
-            return candidate;
+            return Ok(candidate);
         }
     }
 
-    path
+    Err(anyhow::anyhow!("Could not find a unique destination path for {}", path.display()))
 }
 
 fn copy_priority(file: &ScannedFile) -> u8 {

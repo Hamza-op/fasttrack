@@ -228,11 +228,7 @@ impl Database {
             return Ok(());
         }
 
-        if let Some(backup) = self.latest_backup()? {
-            fs::copy(&backup, &self.paths.db_file)?;
-        }
-
-        Ok(())
+        Err(anyhow::anyhow!("Database corruption detected ({}). Please run a quick repair or restore from backup manually.", integrity))
     }
 
     pub fn check_integrity(&self) -> Result<()> {

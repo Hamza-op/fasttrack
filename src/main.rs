@@ -1086,15 +1086,7 @@ fn same_source_path(left: &str, right: &str) -> bool {
         return false;
     }
 
-    #[cfg(windows)]
-    {
-        left.eq_ignore_ascii_case(right)
-    }
-
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
+    left.eq_ignore_ascii_case(right)
 }
 
 fn get_current_scan(state: &AppState) -> Result<Option<ScanSummary>> {
