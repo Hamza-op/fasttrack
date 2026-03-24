@@ -10,7 +10,7 @@ use std::os::windows::fs::MetadataExt;
 #[cfg(windows)]
 use windows::core::PCWSTR;
 #[cfg(windows)]
-use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
 #[cfg(windows)]
 use windows::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, GetExplicitEntriesFromAclW, GetNamedSecurityInfoW, GetTrusteeFormW,
@@ -19,8 +19,8 @@ use windows::Win32::Security::Authorization::{
 };
 #[cfg(windows)]
 use windows::Win32::Security::{
-    CreateWellKnownSid, ACL, ACE_FLAGS, DACL_SECURITY_INFORMATION, IsWellKnownSid,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE, WinWorldSid,
+    CreateWellKnownSid, IsWellKnownSid, WinWorldSid, ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE,
 };
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{
@@ -101,6 +101,7 @@ pub fn hide_manifest(_path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
 pub fn prepare_manifest_for_write(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -255,7 +256,10 @@ pub fn protect_folder_from_delete(_path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn ensure_win32_success(status: windows::Win32::Foundation::WIN32_ERROR, context: &str) -> Result<()> {
+fn ensure_win32_success(
+    status: windows::Win32::Foundation::WIN32_ERROR,
+    context: &str,
+) -> Result<()> {
     if status == ERROR_SUCCESS {
         return Ok(());
     }
@@ -271,7 +275,8 @@ fn delete_protection_present(existing_dacl: *mut ACL) -> bool {
 
     let mut entry_count = 0u32;
     let mut entries: *mut EXPLICIT_ACCESS_W = std::ptr::null_mut();
-    let status = unsafe { GetExplicitEntriesFromAclW(existing_dacl, &mut entry_count, &mut entries) };
+    let status =
+        unsafe { GetExplicitEntriesFromAclW(existing_dacl, &mut entry_count, &mut entries) };
     if status != ERROR_SUCCESS || entries.is_null() {
         return false;
     }

@@ -53,7 +53,7 @@ pub fn detect_drives() -> Result<Vec<DetectedDrive>> {
             });
         }
 
-        return Ok(drives);
+        Ok(drives)
     }
 
     #[cfg(target_os = "macos")]
@@ -75,7 +75,7 @@ pub fn detect_drives() -> Result<Vec<DetectedDrive>> {
                 });
             }
         }
-        return Ok(drives);
+        Ok(drives)
     }
 
     #[cfg(target_os = "linux")]
@@ -106,7 +106,7 @@ pub fn detect_drives() -> Result<Vec<DetectedDrive>> {
                 }
             }
         }
-        return Ok(drives);
+        Ok(drives)
     }
 
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]

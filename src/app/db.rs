@@ -259,40 +259,47 @@ impl Database {
         })
     }
 
-    fn latest_backup(&self) -> Result<Option<PathBuf>> {
-        let mut entries: Vec<PathBuf> = fs::read_dir(&self.paths.backups_dir)?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("db"))
-            .collect();
-        entries.sort();
-        Ok(entries.pop())
-    }
-
     pub fn backup_database(&self) -> Result<()> {
         if !self.paths.db_file.exists() {
             return Ok(());
         }
 
-        let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-        let backup = self
-            .paths
-            .backups_dir
-            .join(format!("moon_ingest_backup_{timestamp}.db"));
-        fs::copy(&self.paths.db_file, backup)?;
+        self.with_connection(|connection| {
+            // In WAL mode, recent commits can still live in *.db-wal.
+            // Checkpoint first so the copied main DB file is complete.
+            let _ = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
 
-        let mut backups: Vec<PathBuf> = fs::read_dir(&self.paths.backups_dir)?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .collect();
-        backups.sort();
-        while backups.len() > 5 {
-            if let Some(path) = backups.first().cloned() {
-                let _ = fs::remove_file(&path);
-                backups.remove(0);
+            let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+            let backup = self
+                .paths
+                .backups_dir
+                .join(format!("moon_ingest_backup_{timestamp}.db"));
+            fs::copy(&self.paths.db_file, backup)?;
+
+            let mut backups: Vec<PathBuf> = fs::read_dir(&self.paths.backups_dir)?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+                })
+                .collect();
+            backups.sort();
+            while backups.len() > 5 {
+                if let Some(path) = backups.first().cloned() {
+                    let _ = fs::remove_file(&path);
+                    backups.remove(0);
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn find_client_base_path(&self, client_name: &str) -> Result<Option<PathBuf>> {
@@ -694,7 +701,13 @@ impl Database {
 
             if let Some(id) = existing {
                 connection.execute(
-                    "UPDATE events SET destination_path = ?2, status = 'in_progress' WHERE id = ?1",
+                    r#"
+                    UPDATE events
+                    SET destination_path = ?2,
+                        status = 'in_progress',
+                        completed_at = NULL
+                    WHERE id = ?1
+                    "#,
                     params![id, destination_path.display().to_string()],
                 )?;
                 return Ok(id);
@@ -752,7 +765,7 @@ impl Database {
     ) -> Result<Vec<DuplicateRecord>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                    r#"
+                r#"
                     SELECT e.event_name, f.xxh3_hash, f.dest_path
                     FROM files f
                     JOIN events e ON e.id = f.event_id
@@ -767,7 +780,7 @@ impl Database {
                     ORDER BY f.id DESC
                     LIMIT 8
                     "#,
-                )?;
+            )?;
             let rows = statement.query_map(
                 params![
                     client_name,
@@ -976,6 +989,7 @@ impl Database {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn mark_event(
         &self,
         event_id: i64,
@@ -1190,7 +1204,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::app::settings::AppPaths;
-    use crate::app::types::{FileStatus, MediaType, ScannedFile};
+    use crate::app::types::{EventStatus, FileStatus, MediaType, ScannedFile};
 
     use super::Database;
 
@@ -1282,5 +1296,44 @@ mod tests {
         let options = db.event_options("No Client").unwrap();
         assert!(options.iter().any(|option| option.name == "Nikkah"));
         assert!(options.iter().any(|option| option.name == "Ubtan"));
+    }
+
+    #[test]
+    fn prepare_event_clears_completed_at_when_resuming_partial() {
+        let temp = tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(&paths.root_dir).unwrap();
+        let db = Database::open(&paths).unwrap();
+
+        let client_id = db
+            .upsert_client("Resume Client", Path::new(r"D:\Projects"), None)
+            .unwrap();
+        let destination = Path::new(r"D:\Projects\Resume Client\Barat");
+        let event_id = db.prepare_event(client_id, "Barat", destination).unwrap();
+
+        db.mark_event(
+            event_id,
+            EventStatus::Partial,
+            destination,
+            0,
+            0,
+            1,
+            10,
+            false,
+        )
+        .unwrap();
+
+        let resumed_id = db.prepare_event(client_id, "Barat", destination).unwrap();
+        assert_eq!(resumed_id, event_id);
+
+        let latest = db
+            .latest_event_for_client_event("Resume Client", "Barat")
+            .unwrap()
+            .expect("expected event");
+        assert_eq!(latest.status, EventStatus::InProgress);
+        assert!(
+            latest.completed_at.is_none(),
+            "completed_at should be cleared on resume"
+        );
     }
 }

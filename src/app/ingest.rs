@@ -118,8 +118,8 @@ impl IngestEngine {
             }
 
             let tracked_record = existing.get(&file.source_path);
-            let reuse_tracked_destination = tracked_record
-                .is_some_and(|record| tracked_record_matches_file(record, file));
+            let reuse_tracked_destination =
+                tracked_record.is_some_and(|record| tracked_record_matches_file(record, file));
             if let Some(record) = tracked_record {
                 if matches!(record.status, FileStatus::Verified) && record.dest_path.exists() {
                     if reuse_tracked_destination {
@@ -376,12 +376,13 @@ impl IngestEngine {
                 manifest_path.display()
             )
         })?;
-        let manifest_path = write_manifest(&preflight.destination_root, &manifest).with_context(|| {
-            format!(
-                "Could not write manifest in '{}'.",
-                preflight.destination_root.display()
-            )
-        })?;
+        let manifest_path =
+            write_manifest(&preflight.destination_root, &manifest).with_context(|| {
+                format!(
+                    "Could not write manifest in '{}'.",
+                    preflight.destination_root.display()
+                )
+            })?;
         let _ = hide_manifest(&manifest_path);
         info!("wrote manifest {}", manifest_path.display());
 
@@ -771,7 +772,10 @@ fn unique_destination(path: PathBuf) -> Result<PathBuf> {
         }
     }
 
-    Err(anyhow::anyhow!("Could not find a unique destination path for {}", path.display()))
+    Err(anyhow::anyhow!(
+        "Could not find a unique destination path for {}",
+        path.display()
+    ))
 }
 
 fn copy_priority(file: &ScannedFile) -> u8 {
@@ -915,7 +919,9 @@ fn tracked_record_matches_file(record: &StoredFileRecord, file: &ScannedFile) ->
 fn same_path(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]
     {
-        left.display().to_string().eq_ignore_ascii_case(&right.display().to_string())
+        left.display()
+            .to_string()
+            .eq_ignore_ascii_case(&right.display().to_string())
     }
     #[cfg(not(windows))]
     {
@@ -957,16 +963,22 @@ async fn hash_file_partial(path: &Path) -> Result<String> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{atomic::AtomicBool, Arc};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     use tempfile::tempdir;
     use tokio::runtime::Builder;
 
     use crate::app::db::Database;
+    use crate::app::errors::MoonError;
     use crate::app::manifest::Manifest;
     use crate::app::scanner::scan_drive;
     use crate::app::settings::{AppPaths, Settings};
-    use crate::app::types::{LockMode, MediaType, ScanSummary, ScannedFile, SessionRequest};
+    use crate::app::types::{
+        EventStatus, LockMode, MediaType, ScanSummary, ScannedFile, SessionRequest,
+    };
 
     use super::IngestEngine;
 
@@ -1152,8 +1164,11 @@ mod tests {
         runtime
             .block_on(engine.run_session(request_one, Arc::new(AtomicBool::new(false)), |_| {}))
             .expect("first run session");
-        let second = runtime
-            .block_on(engine.run_session(request_two, Arc::new(AtomicBool::new(false)), |_| {}));
+        let second = runtime.block_on(engine.run_session(
+            request_two,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        ));
 
         assert!(
             second.is_ok(),
@@ -1240,8 +1255,11 @@ mod tests {
         runtime
             .block_on(engine.run_session(request_one, Arc::new(AtomicBool::new(false)), |_| {}))
             .expect("first run session");
-        let second = runtime
-            .block_on(engine.run_session(request_two, Arc::new(AtomicBool::new(false)), |_| {}));
+        let second = runtime.block_on(engine.run_session(
+            request_two,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        ));
 
         assert!(
             second.is_ok(),
@@ -1776,9 +1794,10 @@ mod tests {
         );
         assert_eq!(report.verified_files, 1);
         assert!(
-            report.warnings.iter().any(|warning| {
-                warning.contains("previous copy could not be read")
-            }),
+            report
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("previous copy could not be read") }),
             "expected warning about unreadable duplicate candidate"
         );
     }
@@ -1991,6 +2010,184 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("Skipped duplicate")));
+    }
+
+    #[test]
+    fn cancellation_mid_copy_marks_event_partial_and_resumable() {
+        let temp = tempdir().expect("temp dir");
+        let source = temp.path().join("cancel_card");
+        let base = temp.path().join("dest");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&base).expect("create base");
+
+        let src = source.join("BIG001.MP4");
+        fs::write(&src, vec![0x5Au8; 32 * 1024 * 1024]).expect("write large source");
+        let file = make_scanned_file(&src, MediaType::Video);
+        let summary = ScanSummary {
+            manufacturer: "Generic".into(),
+            drive_root: source.clone(),
+            card_label: Some(source.display().to_string()),
+            total_size_bytes: file.size_bytes,
+            total_files: 1,
+            raw_count: 0,
+            jpg_count: 0,
+            video_count: 1,
+            audio_count: 0,
+            skipped_count: 0,
+            files: vec![file],
+        };
+
+        let paths = test_paths(temp.path());
+        paths.ensure().expect("ensure paths");
+        let db = Database::open(&paths).expect("db open");
+        let settings = make_settings(&base);
+        let engine = IngestEngine::new(db.clone(), settings, paths.clone());
+
+        let request = SessionRequest {
+            source_drive: source,
+            client_name: "Client Cancel".into(),
+            event_name: "Barat".into(),
+            camera_label_override: None,
+            skip_already_copied: false,
+            base_path: base,
+            scan: summary,
+        };
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_once = Arc::new(AtomicBool::new(false));
+        let cancel_for_progress = cancel_flag.clone();
+        let cancel_once_for_progress = cancel_once.clone();
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result =
+            runtime.block_on(
+                engine.run_session(request, cancel_flag.clone(), move |progress| {
+                    if progress.bytes_done > 0
+                        && !cancel_once_for_progress.swap(true, Ordering::Relaxed)
+                    {
+                        cancel_for_progress.store(true, Ordering::Relaxed);
+                    }
+                }),
+            );
+
+        let error = result.expect_err("expected cancellation");
+        let cancelled = error
+            .downcast_ref::<MoonError>()
+            .is_some_and(|value| matches!(value, MoonError::Cancelled { .. }));
+        assert!(cancelled, "expected cancel error, got {error:#}");
+
+        let pending = db.pending_resumes().expect("pending resumes");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].status, EventStatus::Partial);
+        assert_eq!(pending[0].client_name, "Client Cancel");
+        assert_eq!(pending[0].event_name, "Barat");
+
+        let latest = db
+            .latest_event_for_client_event("Client Cancel", "Barat")
+            .expect("latest event query")
+            .expect("expected latest event");
+        assert_eq!(latest.status, EventStatus::Partial);
+        assert!(
+            !paths.lock_file.exists(),
+            "session lock should be removed on cancellation"
+        );
+    }
+
+    #[test]
+    #[ignore = "long-running soak test; run explicitly"]
+    fn soak_cancel_resume_cycles() {
+        let temp = tempdir().expect("temp dir");
+        let base = temp.path().join("dest");
+        fs::create_dir_all(&base).expect("create base");
+
+        let paths = test_paths(temp.path());
+        paths.ensure().expect("ensure paths");
+        let db = Database::open(&paths).expect("db open");
+        let settings = make_settings(&base);
+        let engine = IngestEngine::new(db.clone(), settings, paths);
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        for cycle in 0..6 {
+            let source = temp.path().join(format!("soak_card_{cycle}"));
+            fs::create_dir_all(&source).expect("create source");
+            let src = source.join("SOAK001.MP4");
+            fs::write(&src, vec![cycle as u8; 24 * 1024 * 1024]).expect("write source");
+            let file = make_scanned_file(&src, MediaType::Video);
+            let summary = ScanSummary {
+                manufacturer: "Generic".into(),
+                drive_root: source.clone(),
+                card_label: Some(source.display().to_string()),
+                total_size_bytes: file.size_bytes,
+                total_files: 1,
+                raw_count: 0,
+                jpg_count: 0,
+                video_count: 1,
+                audio_count: 0,
+                skipped_count: 0,
+                files: vec![file],
+            };
+
+            let request = SessionRequest {
+                source_drive: source.clone(),
+                client_name: "Soak Client".into(),
+                event_name: format!("Cycle{cycle}"),
+                camera_label_override: None,
+                skip_already_copied: false,
+                base_path: base.clone(),
+                scan: summary.clone(),
+            };
+
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let cancel_once = Arc::new(AtomicBool::new(false));
+            let cancel_for_progress = cancel_flag.clone();
+            let cancel_once_for_progress = cancel_once.clone();
+
+            let cancelled = runtime.block_on(engine.run_session(
+                request.clone(),
+                cancel_flag.clone(),
+                move |progress| {
+                    if progress.bytes_done > 0
+                        && !cancel_once_for_progress.swap(true, Ordering::Relaxed)
+                    {
+                        cancel_for_progress.store(true, Ordering::Relaxed);
+                    }
+                },
+            ));
+            assert!(
+                cancelled.is_err(),
+                "cycle {cycle}: expected initial run to cancel"
+            );
+
+            let resumed = runtime.block_on(engine.run_session(
+                request,
+                Arc::new(AtomicBool::new(false)),
+                |_| {},
+            ));
+            let report = resumed.expect("resume should complete");
+            assert_eq!(
+                report.failed_files, 0,
+                "cycle {cycle}: resumed ingest should not fail"
+            );
+            assert_eq!(
+                report.verified_files, 1,
+                "cycle {cycle}: resumed ingest should verify one file"
+            );
+
+            db.check_integrity().expect("db integrity should remain ok");
+        }
+
+        assert!(
+            db.pending_resumes()
+                .expect("pending resumes query")
+                .is_empty(),
+            "all soak cycles should finish with no resumable events left"
+        );
     }
 
     #[test]

@@ -91,7 +91,7 @@ fn main() -> Result<()> {
     apply_event_menu(
         &window,
         &initial_event_options,
-        &window.get_event_name().to_string(),
+        window.get_event_name().as_ref(),
     );
     if mock_mode {
         apply_mock_bootstrap(&window);
@@ -140,7 +140,7 @@ fn wire_refresh(window: &AppWindow, state: AppState) {
                 let text = format_detected_drives(&drives);
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_drives_text(text.into());
-                    if !can_apply_auto_source(&state, &ui.get_source_drive().to_string(), &source_drive)
+                    if !can_apply_auto_source(&state, ui.get_source_drive().as_ref(), &source_drive)
                     {
                         ui.set_status_text("Drive refresh complete.".into());
                         return;
@@ -177,40 +177,39 @@ fn start_drive_polling(window: &AppWindow, state: AppState, mock_mode: bool) {
             let Some(_) = weak.upgrade() else {
                 break;
             };
-            match detect_drives() {
-                Ok(drives) => {
-                    let source_drive = primary_auto_scan_source(&drives);
-                    let snapshot = format_detected_drives(&drives);
-                    let primary_signature = primary_detected_signature(&drives);
-                    let snapshot_changed = snapshot != last_snapshot;
-                    let primary_changed = primary_signature != last_primary_signature;
+            if let Ok(drives) = detect_drives() {
+                let source_drive = primary_auto_scan_source(&drives);
+                let snapshot = format_detected_drives(&drives);
+                let primary_signature = primary_detected_signature(&drives);
+                let snapshot_changed = snapshot != last_snapshot;
+                let primary_changed = primary_signature != last_primary_signature;
 
-                    if snapshot_changed || primary_changed {
-                        last_snapshot = snapshot.clone();
-                        last_primary_signature = primary_signature.clone();
-                        let state = state.clone();
-                        let _ = weak.upgrade_in_event_loop(move |ui| {
-                            ui.set_drives_text(snapshot.into());
-                            if !can_apply_auto_source(
+                if snapshot_changed || primary_changed {
+                    last_snapshot = snapshot.clone();
+                    last_primary_signature = primary_signature.clone();
+                    let state = state.clone();
+                    let _ = weak.upgrade_in_event_loop(move |ui| {
+                        ui.set_drives_text(snapshot.into());
+                        if !primary_changed
+                            || !can_apply_auto_source(
                                 &state,
-                                &ui.get_source_drive().to_string(),
+                                ui.get_source_drive().as_ref(),
                                 &source_drive,
-                            ) {
-                                return;
-                            }
+                            )
+                        {
+                            return;
+                        }
 
-                            apply_source_change(
-                                &state,
-                                &ui,
-                                &source_drive,
-                                SourceChangeOrigin::AutoDetected,
-                                true,
-                                "Removable media detected. Starting scan...",
-                            );
-                        });
-                    }
+                        apply_source_change(
+                            &state,
+                            &ui,
+                            &source_drive,
+                            SourceChangeOrigin::AutoDetected,
+                            true,
+                            "Removable media detected. Starting scan...",
+                        );
+                    });
                 }
-                Err(_) => {}
             }
             thread::sleep(Duration::from_secs(2));
         }
@@ -339,7 +338,7 @@ fn wire_scan(window: &AppWindow, state: AppState) {
                     };
                     let _ = weak.upgrade_in_event_loop(move |ui| {
                         ui.set_event_name(suggestion.into());
-                        apply_event_menu(&ui, &event_options, &ui.get_event_name().to_string());
+                        apply_event_menu(&ui, &event_options, ui.get_event_name().as_ref());
                         ui.set_base_path(base_path.into());
                         if duplicate_prompt.is_some() {
                             ui.set_status_text(
@@ -395,6 +394,13 @@ fn wire_scan(window: &AppWindow, state: AppState) {
 fn wire_start(window: &AppWindow, state: AppState) {
     let weak = window.as_weak();
     window.on_start_ingest(move || {
+        if state.operation_active.load(Ordering::Relaxed) {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_status_text("Another operation is already running.".into());
+            }
+            return;
+        }
+
         if state.mock_mode {
             simulate_mock_ingest(weak.clone());
             return;
@@ -403,14 +409,14 @@ fn wire_start(window: &AppWindow, state: AppState) {
             return;
         };
 
-        let client_name = match validate_folder_name(&ui.get_client_name().to_string(), 100) {
+        let client_name = match validate_folder_name(ui.get_client_name().as_ref(), 100) {
             Ok(value) => value,
             Err(error) => {
                 ui.set_status_text(error.to_string().into());
                 return;
             }
         };
-        let event_name = match validate_folder_name(&ui.get_event_name().to_string(), 100) {
+        let event_name = match validate_folder_name(ui.get_event_name().as_ref(), 100) {
             Ok(value) => value,
             Err(error) => {
                 ui.set_status_text(error.to_string().into());
@@ -440,8 +446,15 @@ fn wire_start(window: &AppWindow, state: AppState) {
             return;
         }
 
+        if state
+            .operation_active
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            ui.set_status_text("Another operation is already running.".into());
+            return;
+        }
         state.cancel_flag.store(false, Ordering::Relaxed);
-        state.operation_active.store(true, Ordering::Relaxed);
         ui.set_status_text("Starting ingest...".into());
 
         let request = SessionRequest {
@@ -709,7 +722,7 @@ fn wire_client_typing_suggestions(window: &AppWindow, state: AppState) {
                 if state_for_ui.client_query_seq.load(Ordering::Relaxed) != request_id {
                     return;
                 }
-                if ui.get_client_name().to_string() != typed_query {
+                if ui.get_client_name() != typed_query.as_str() {
                     return;
                 }
                 if selected_name.eq_ignore_ascii_case(typed_query.trim()) {
@@ -777,7 +790,7 @@ fn wire_event_typing_suggestions(window: &AppWindow, state: AppState) {
                 if state_for_ui.event_query_seq.load(Ordering::Relaxed) != request_id {
                     return;
                 }
-                if ui.get_event_name().to_string() != typed_query {
+                if ui.get_event_name() != typed_query.as_str() {
                     return;
                 }
                 apply_event_menu(&ui, &menu_options, &typed_query);
@@ -796,7 +809,7 @@ fn wire_source_drive_edit(window: &AppWindow, state: AppState) {
         apply_source_change(
             &state,
             &ui,
-            &value.to_string(),
+            value.as_ref(),
             SourceChangeOrigin::Manual,
             false,
             "Source changed. Scan again before ingest.",
@@ -988,8 +1001,11 @@ fn apply_source_change(
     }
 
     if start_scan {
-        ui.set_status_text(status_text.into());
-        ui.invoke_scan_card();
+        let should_scan = scan_changed || matches!(origin, SourceChangeOrigin::Manual);
+        if should_scan {
+            ui.set_status_text(status_text.into());
+            ui.invoke_scan_card();
+        }
     } else if scan_changed {
         ui.set_status_text(status_text.into());
     }
@@ -1055,7 +1071,11 @@ fn primary_detected_signature(drives: &[app::drive_monitor::DetectedDrive]) -> S
                 "{}|{}|{}",
                 drive.root.display(),
                 drive.label,
-                drive.free_bytes
+                if drive.is_removable {
+                    "removable"
+                } else {
+                    "fixed"
+                }
             )
         })
         .unwrap_or_default()
@@ -1080,13 +1100,51 @@ fn format_detected_drives(drives: &[app::drive_monitor::DetectedDrive]) -> Strin
 }
 
 fn same_source_path(left: &str, right: &str) -> bool {
-    let left = left.trim();
-    let right = right.trim();
-    if left.is_empty() || right.is_empty() {
+    let Some(left) = normalize_source_path(left) else {
         return false;
+    };
+    let Some(right) = normalize_source_path(right) else {
+        return false;
+    };
+
+    #[cfg(windows)]
+    {
+        left.eq_ignore_ascii_case(&right)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn normalize_source_path(value: &str) -> Option<String> {
+    let mut normalized = value.trim().to_string();
+    if normalized.is_empty() {
+        return None;
     }
 
-    left.eq_ignore_ascii_case(right)
+    #[cfg(windows)]
+    {
+        normalized = normalized.replace('/', "\\");
+        if normalized.len() == 2 && normalized.as_bytes().get(1) == Some(&b':') {
+            normalized.push('\\');
+        }
+        while normalized.len() > 3 && normalized.ends_with('\\') {
+            normalized.pop();
+        }
+        if normalized.len() >= 2 && normalized.as_bytes().get(1) == Some(&b':') {
+            normalized.replace_range(0..1, &normalized[0..1].to_ascii_uppercase());
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        while normalized.len() > 1 && normalized.ends_with('/') {
+            normalized.pop();
+        }
+    }
+
+    Some(normalized)
 }
 
 fn get_current_scan(state: &AppState) -> Result<Option<ScanSummary>> {
@@ -1316,4 +1374,23 @@ fn simulate_mock_ingest(weak: slint::Weak<AppWindow>) {
             );
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_source_path;
+
+    #[cfg(windows)]
+    #[test]
+    fn source_path_comparison_normalizes_windows_forms() {
+        assert!(same_source_path(r"E:", r"E:\"));
+        assert!(same_source_path(r"e:/DCIM", r"E:\DCIM\"));
+        assert!(same_source_path(r"F:\MEDIA\", r"f:\media"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn source_path_comparison_trims_unix_trailing_slash() {
+        assert!(same_source_path("/mnt/card", "/mnt/card/"));
+    }
 }
