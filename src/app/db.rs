@@ -282,19 +282,23 @@ impl Database {
                 .join(format!("fasttrack_backup_{timestamp}.db"));
             fs::copy(&self.paths.db_file, backup)?;
 
-            let mut backups: Vec<(PathBuf, std::time::SystemTime)> = fs::read_dir(&self.paths.backups_dir)?
-                .filter_map(|entry| entry.ok())
-                .map(|entry| {
-                    let path = entry.path();
-                    let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    (path, modified)
-                })
-                .filter(|(path, _)| {
-                    path.extension()
-                        .and_then(|value| value.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
-                })
-                .collect();
+            let mut backups: Vec<(PathBuf, std::time::SystemTime)> =
+                fs::read_dir(&self.paths.backups_dir)?
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| {
+                        let path = entry.path();
+                        let modified = entry
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        (path, modified)
+                    })
+                    .filter(|(path, _)| {
+                        path.extension()
+                            .and_then(|value| value.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+                    })
+                    .collect();
             backups.sort_by_key(|&(_, modified)| modified);
             while backups.len() > 5 {
                 let (path, _) = backups.remove(0);
@@ -436,7 +440,11 @@ impl Database {
         })
     }
 
-    pub fn suggest_next_event(&self, client_name: &str, event_sequence: &[String]) -> Result<String> {
+    pub fn suggest_next_event(
+        &self,
+        client_name: &str,
+        event_sequence: &[String],
+    ) -> Result<String> {
         let completed = self.with_connection(|connection| {
             let mut statement = connection.prepare(
                 r#"
@@ -458,7 +466,11 @@ impl Database {
         Ok(next_event_suggestion(&completed, event_sequence))
     }
 
-    pub fn event_options(&self, client_name: &str, event_sequence: &[String]) -> Result<Vec<EventOption>> {
+    pub fn event_options(
+        &self,
+        client_name: &str,
+        event_sequence: &[String],
+    ) -> Result<Vec<EventOption>> {
         self.with_connection(|connection| {
             let mut completed_statement = connection.prepare(
                 r#"

@@ -408,13 +408,16 @@ mod tests {
             "Barat"
         );
         assert_eq!(
-            next_event_suggestion(&[
-                "Ubtan".into(),
-                "Mehndi".into(),
-                "Barat".into(),
-                "Walima".into(),
-                "Portraits".into()
-            ], &seq),
+            next_event_suggestion(
+                &[
+                    "Ubtan".into(),
+                    "Mehndi".into(),
+                    "Barat".into(),
+                    "Walima".into(),
+                    "Portraits".into()
+                ],
+                &seq
+            ),
             "Custom..."
         );
     }

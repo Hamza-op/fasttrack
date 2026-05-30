@@ -87,7 +87,9 @@ fn main() -> Result<()> {
             .to_string()
             .into(),
     );
-    let initial_event_options = db.event_options("", &settings.ingest.event_sequence).unwrap_or_default();
+    let initial_event_options = db
+        .event_options("", &settings.ingest.event_sequence)
+        .unwrap_or_default();
     apply_event_menu(
         &window,
         &initial_event_options,
@@ -663,7 +665,9 @@ fn wire_suggest_client(window: &AppWindow, state: AppState) {
             let suggested_event = state
                 .db
                 .suggest_next_event(selected_name.trim(), &state.settings.ingest.event_sequence)
-                .unwrap_or_else(|_| next_event_suggestion(&[], &state.settings.ingest.event_sequence));
+                .unwrap_or_else(|_| {
+                    next_event_suggestion(&[], &state.settings.ingest.event_sequence)
+                });
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 ui.set_client_name(selected_name.into());
                 ui.set_base_path(selected_base.into());
@@ -714,7 +718,9 @@ fn wire_client_typing_suggestions(window: &AppWindow, state: AppState) {
             let suggested_event = state
                 .db
                 .suggest_next_event(selected_name.trim(), &state.settings.ingest.event_sequence)
-                .unwrap_or_else(|_| next_event_suggestion(&[], &state.settings.ingest.event_sequence));
+                .unwrap_or_else(|_| {
+                    next_event_suggestion(&[], &state.settings.ingest.event_sequence)
+                });
             let typed_query = query.clone();
             let state_for_ui = state.clone();
 
@@ -756,18 +762,22 @@ fn wire_event_typing_suggestions(window: &AppWindow, state: AppState) {
                 return;
             }
 
-            let full_options = match state.db.event_options(client_name.trim(), &state.settings.ingest.event_sequence) {
+            let full_options = match state
+                .db
+                .event_options(client_name.trim(), &state.settings.ingest.event_sequence)
+            {
                 Ok(options) => options,
                 Err(_) => return,
             };
-            let options =
-                match state
-                    .db
-                    .search_event_options(client_name.trim(), event_query.trim(), 8, &state.settings.ingest.event_sequence)
-                {
-                    Ok(options) => options,
-                    Err(_) => return,
-                };
+            let options = match state.db.search_event_options(
+                client_name.trim(),
+                event_query.trim(),
+                8,
+                &state.settings.ingest.event_sequence,
+            ) {
+                Ok(options) => options,
+                Err(_) => return,
+            };
             if state.event_query_seq.load(Ordering::Relaxed) != request_id {
                 return;
             }
@@ -781,7 +791,9 @@ fn wire_event_typing_suggestions(window: &AppWindow, state: AppState) {
             let suggested = state
                 .db
                 .suggest_next_event(client_name.trim(), &state.settings.ingest.event_sequence)
-                .unwrap_or_else(|_| next_event_suggestion(&[], &state.settings.ingest.event_sequence));
+                .unwrap_or_else(|_| {
+                    next_event_suggestion(&[], &state.settings.ingest.event_sequence)
+                });
             let report = format_event_options(&menu_options, &suggested);
             let typed_query = event_query.clone();
             let state_for_ui = state.clone();

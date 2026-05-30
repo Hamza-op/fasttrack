@@ -69,7 +69,8 @@ impl IngestEngine {
         let client_id = self
             .db
             .upsert_client(&request.client_name, &request.base_path, None)?;
-        self.db.remember_custom_event(&request.event_name, &self.settings.ingest.event_sequence)?;
+        self.db
+            .remember_custom_event(&request.event_name, &self.settings.ingest.event_sequence)?;
 
         let event_id =
             self.db
@@ -809,13 +810,12 @@ where
             let _ = fs::remove_file(destination).await;
         }
 
-        let mut source =
-            File::open(&file.source_path)
-                .await
-                .map_err(|source| FastTrackError::SourceReadError {
-                    path: file.source_path.clone(),
-                    source,
-                })?;
+        let mut source = File::open(&file.source_path).await.map_err(|source| {
+            FastTrackError::SourceReadError {
+                path: file.source_path.clone(),
+                source,
+            }
+        })?;
         let mut dest =
             File::create(destination)
                 .await
@@ -837,24 +837,22 @@ where
                 }
                 .into());
             }
-            let read =
-                source
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|source| FastTrackError::SourceReadError {
-                        path: file.source_path.clone(),
-                        source,
-                    })?;
+            let read = source.read(&mut buffer).await.map_err(|source| {
+                FastTrackError::SourceReadError {
+                    path: file.source_path.clone(),
+                    source,
+                }
+            })?;
             if read == 0 {
                 break;
             }
             hasher.update(&buffer[..read]);
-            dest.write_all(&buffer[..read])
-                .await
-                .map_err(|source| FastTrackError::DestWriteError {
+            dest.write_all(&buffer[..read]).await.map_err(|source| {
+                FastTrackError::DestWriteError {
                     path: destination.to_path_buf(),
                     source,
-                })?;
+                }
+            })?;
             total += read as u64;
 
             let now = Instant::now();

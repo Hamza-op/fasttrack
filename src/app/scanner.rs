@@ -445,7 +445,9 @@ mod tests {
         let cancel_flag = Arc::new(AtomicBool::new(true));
         let error = scan_drive_with_cancel(temp.path(), false, false, Some(cancel_flag))
             .expect_err("scan should cancel");
-        let scan_error = error.downcast_ref::<FastTrackError>().expect("fasttrack error");
+        let scan_error = error
+            .downcast_ref::<FastTrackError>()
+            .expect("fasttrack error");
         assert!(matches!(scan_error, FastTrackError::ScanCancelled));
     }
 }
