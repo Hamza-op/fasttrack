@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::app::errors::MoonError;
+use crate::app::errors::FastTrackError;
 use crate::app::types::{MediaType, ScanSummary, ScannedFile};
 
 const SKIP_DIRS: &[&str] = &["THMBNL", "MISC", "CANONMSC", "BACKUP"];
@@ -36,7 +36,7 @@ pub fn scan_drive_with_cancel(
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<ScanSummary> {
     if !root.exists() {
-        return Err(MoonError::NoMediaFound {
+        return Err(FastTrackError::NoMediaFound {
             drive: root.display().to_string(),
         }
         .into());
@@ -54,7 +54,7 @@ pub fn scan_drive_with_cancel(
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Relaxed))
         {
-            return Err(MoonError::ScanCancelled.into());
+            return Err(FastTrackError::ScanCancelled.into());
         }
 
         let entry = match entry {
@@ -140,7 +140,7 @@ pub fn scan_drive_with_cancel(
     }
 
     if files.is_empty() {
-        return Err(MoonError::NoMediaFound {
+        return Err(FastTrackError::NoMediaFound {
             drive: root.display().to_string(),
         }
         .into());
@@ -355,7 +355,7 @@ mod tests {
     use std::sync::{atomic::AtomicBool, Arc};
 
     use super::{detect_manufacturer, scan_drive, scan_drive_with_cancel};
-    use crate::app::errors::MoonError;
+    use crate::app::errors::FastTrackError;
     use crate::app::types::MediaType;
 
     #[test]
@@ -445,7 +445,7 @@ mod tests {
         let cancel_flag = Arc::new(AtomicBool::new(true));
         let error = scan_drive_with_cancel(temp.path(), false, false, Some(cancel_flag))
             .expect_err("scan should cancel");
-        let scan_error = error.downcast_ref::<MoonError>().expect("moon error");
-        assert!(matches!(scan_error, MoonError::ScanCancelled));
+        let scan_error = error.downcast_ref::<FastTrackError>().expect("fasttrack error");
+        assert!(matches!(scan_error, FastTrackError::ScanCancelled));
     }
 }

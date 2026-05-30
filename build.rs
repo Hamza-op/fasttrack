@@ -5,7 +5,7 @@ fn main() {
     if cfg!(target_os = "windows") {
         let manifest = r#"
             <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-              <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="MoonIngest" type="win32"/>
+              <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="FastTrack" type="win32"/>
               <description>FastTrack</description>
               <application xmlns="urn:schemas-microsoft-com:asm.v3">
                 <windowsSettings>

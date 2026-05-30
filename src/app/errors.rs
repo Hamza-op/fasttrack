@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum MoonError {
+pub enum FastTrackError {
     #[error("Failed to read source file '{path}': {source}")]
     SourceReadError {
         path: PathBuf,

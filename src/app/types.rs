@@ -4,9 +4,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::errors::MoonError;
+use crate::app::errors::FastTrackError;
 
-pub const EVENT_SEQUENCE: [&str; 5] = ["Ubtan", "Mehndi", "Barat", "Walima", "Portraits"];
 pub const MANIFEST_VERSION: u32 = 1;
 pub const PATH_SOFT_LIMIT: usize = 240;
 
@@ -305,15 +304,15 @@ impl FinalReport {
     }
 }
 
-pub fn validate_folder_name(value: &str, max_len: usize) -> Result<String, MoonError> {
+pub fn validate_folder_name(value: &str, max_len: usize) -> Result<String, FastTrackError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(MoonError::InvalidClientName {
+        return Err(FastTrackError::InvalidClientName {
             reason: "value cannot be empty".into(),
         });
     }
     if trimmed.len() > max_len {
-        return Err(MoonError::InvalidClientName {
+        return Err(FastTrackError::InvalidClientName {
             reason: format!("value must be {max_len} characters or fewer"),
         });
     }
@@ -321,18 +320,18 @@ pub fn validate_folder_name(value: &str, max_len: usize) -> Result<String, MoonE
         .chars()
         .any(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
     {
-        return Err(MoonError::InvalidClientName {
+        return Err(FastTrackError::InvalidClientName {
             reason: "value contains Windows-invalid path characters".into(),
         });
     }
     Ok(trimmed.to_string())
 }
 
-pub fn enforce_path_limit(path: &Path) -> Result<(), MoonError> {
+pub fn enforce_path_limit(path: &Path) -> Result<(), FastTrackError> {
     let path_string = path.display().to_string();
     let length = path_string.chars().count();
     if length > PATH_SOFT_LIMIT {
-        return Err(MoonError::PathTooLong {
+        return Err(FastTrackError::PathTooLong {
             path: path_string,
             length,
             max: PATH_SOFT_LIMIT,
@@ -341,8 +340,8 @@ pub fn enforce_path_limit(path: &Path) -> Result<(), MoonError> {
     Ok(())
 }
 
-pub fn next_event_suggestion(completed_events: &[String]) -> String {
-    for event in EVENT_SEQUENCE {
+pub fn next_event_suggestion(completed_events: &[String], event_sequence: &[String]) -> String {
+    for event in event_sequence {
         if !completed_events
             .iter()
             .any(|item| item.eq_ignore_ascii_case(event))
@@ -396,9 +395,16 @@ mod tests {
 
     #[test]
     fn suggests_next_event() {
-        assert_eq!(next_event_suggestion(&[]), "Ubtan");
+        let seq = vec![
+            "Ubtan".to_string(),
+            "Mehndi".to_string(),
+            "Barat".to_string(),
+            "Walima".to_string(),
+            "Portraits".to_string(),
+        ];
+        assert_eq!(next_event_suggestion(&[], &seq), "Ubtan");
         assert_eq!(
-            next_event_suggestion(&["Ubtan".into(), "Mehndi".into()]),
+            next_event_suggestion(&["Ubtan".into(), "Mehndi".into()], &seq),
             "Barat"
         );
         assert_eq!(
@@ -408,7 +414,7 @@ mod tests {
                 "Barat".into(),
                 "Walima".into(),
                 "Portraits".into()
-            ]),
+            ], &seq),
             "Custom..."
         );
     }

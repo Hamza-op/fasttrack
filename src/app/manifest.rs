@@ -77,7 +77,7 @@ impl Manifest {
 }
 
 pub fn write_manifest(event_root: &Path, manifest: &Manifest) -> Result<PathBuf> {
-    let path = event_root.join(".mooningest_manifest.json");
+    let path = event_root.join(".fasttrack_manifest.json");
     let raw = serde_json::to_string_pretty(manifest)?;
     fs::write(&path, raw)?;
     Ok(path)

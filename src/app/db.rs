@@ -279,24 +279,26 @@ impl Database {
             let backup = self
                 .paths
                 .backups_dir
-                .join(format!("moon_ingest_backup_{timestamp}.db"));
+                .join(format!("fasttrack_backup_{timestamp}.db"));
             fs::copy(&self.paths.db_file, backup)?;
 
-            let mut backups: Vec<PathBuf> = fs::read_dir(&self.paths.backups_dir)?
+            let mut backups: Vec<(PathBuf, std::time::SystemTime)> = fs::read_dir(&self.paths.backups_dir)?
                 .filter_map(|entry| entry.ok())
-                .map(|entry| entry.path())
-                .filter(|path| {
+                .map(|entry| {
+                    let path = entry.path();
+                    let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    (path, modified)
+                })
+                .filter(|(path, _)| {
                     path.extension()
                         .and_then(|value| value.to_str())
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
                 })
                 .collect();
-            backups.sort();
+            backups.sort_by_key(|&(_, modified)| modified);
             while backups.len() > 5 {
-                if let Some(path) = backups.first().cloned() {
-                    let _ = fs::remove_file(&path);
-                    backups.remove(0);
-                }
+                let (path, _) = backups.remove(0);
+                let _ = fs::remove_file(&path);
             }
             Ok(())
         })
@@ -417,8 +419,8 @@ impl Database {
         })
     }
 
-    pub fn remember_custom_event(&self, event_name: &str) -> Result<()> {
-        if crate::app::types::EVENT_SEQUENCE
+    pub fn remember_custom_event(&self, event_name: &str, event_sequence: &[String]) -> Result<()> {
+        if event_sequence
             .iter()
             .any(|value| value.eq_ignore_ascii_case(event_name))
         {
@@ -434,7 +436,7 @@ impl Database {
         })
     }
 
-    pub fn suggest_next_event(&self, client_name: &str) -> Result<String> {
+    pub fn suggest_next_event(&self, client_name: &str, event_sequence: &[String]) -> Result<String> {
         let completed = self.with_connection(|connection| {
             let mut statement = connection.prepare(
                 r#"
@@ -453,10 +455,10 @@ impl Database {
             Ok(events)
         })?;
 
-        Ok(next_event_suggestion(&completed))
+        Ok(next_event_suggestion(&completed, event_sequence))
     }
 
-    pub fn event_options(&self, client_name: &str) -> Result<Vec<EventOption>> {
+    pub fn event_options(&self, client_name: &str, event_sequence: &[String]) -> Result<Vec<EventOption>> {
         self.with_connection(|connection| {
             let mut completed_statement = connection.prepare(
                 r#"
@@ -474,10 +476,10 @@ impl Database {
                 completed.push(row?);
             }
 
-            let mut options = crate::app::types::EVENT_SEQUENCE
+            let mut options = event_sequence
                 .iter()
                 .map(|name| EventOption {
-                    name: (*name).to_string(),
+                    name: name.clone(),
                     completed: completed.iter().any(|item| item.eq_ignore_ascii_case(name)),
                 })
                 .collect::<Vec<_>>();
@@ -509,9 +511,10 @@ impl Database {
         client_name: &str,
         query: &str,
         limit: usize,
+        event_sequence: &[String],
     ) -> Result<Vec<EventOption>> {
         let normalized = query.trim().to_ascii_lowercase();
-        let mut options = self.event_options(client_name)?;
+        let mut options = self.event_options(client_name, event_sequence)?;
         if normalized.is_empty() {
             options.truncate(limit.max(1));
             return Ok(options);
@@ -1209,13 +1212,13 @@ mod tests {
     use super::Database;
 
     fn test_paths(root: &Path) -> AppPaths {
-        let root_dir = root.join("MoonIngest");
+        let root_dir = root.join("FastTrack");
         AppPaths {
             root_dir: root_dir.clone(),
             logs_dir: root_dir.join("logs"),
             backups_dir: root_dir.join("backups"),
             settings_file: root_dir.join("settings.toml"),
-            db_file: root_dir.join("moon_ingest.db"),
+            db_file: root_dir.join("fasttrack.db"),
             lock_file: root_dir.join(".lock"),
         }
     }
@@ -1291,9 +1294,16 @@ mod tests {
         let paths = test_paths(temp.path());
         fs::create_dir_all(&paths.root_dir).unwrap();
         let db = Database::open(&paths).unwrap();
-        db.remember_custom_event("Nikkah").unwrap();
+        let seq = vec![
+            "Ubtan".to_string(),
+            "Mehndi".to_string(),
+            "Barat".to_string(),
+            "Walima".to_string(),
+            "Portraits".to_string(),
+        ];
+        db.remember_custom_event("Nikkah", &seq).unwrap();
 
-        let options = db.event_options("No Client").unwrap();
+        let options = db.event_options("No Client", &seq).unwrap();
         assert!(options.iter().any(|option| option.name == "Nikkah"));
         assert!(options.iter().any(|option| option.name == "Ubtan"));
     }

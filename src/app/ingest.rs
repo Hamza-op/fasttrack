@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::app::db::Database;
-use crate::app::errors::MoonError;
+use crate::app::errors::FastTrackError;
 use crate::app::lock::{
     apply_readonly_recursive, clear_readonly_recursive, hide_manifest, mark_folder_system,
     prepare_manifest_for_write, protect_folder_from_delete,
@@ -69,7 +69,7 @@ impl IngestEngine {
         let client_id = self
             .db
             .upsert_client(&request.client_name, &request.base_path, None)?;
-        self.db.remember_custom_event(&request.event_name)?;
+        self.db.remember_custom_event(&request.event_name, &self.settings.ingest.event_sequence)?;
 
         let event_id =
             self.db
@@ -110,7 +110,7 @@ impl IngestEngine {
                     total_bytes,
                     false,
                 )?;
-                return Err(MoonError::Cancelled {
+                return Err(FastTrackError::Cancelled {
                     copied: verified_files as u32,
                     total: total_files as u32,
                 }
@@ -310,8 +310,8 @@ impl IngestEngine {
                 }
                 Err(error) => {
                     if error
-                        .downcast_ref::<MoonError>()
-                        .is_some_and(|value| matches!(value, MoonError::Cancelled { .. }))
+                        .downcast_ref::<FastTrackError>()
+                        .is_some_and(|value| matches!(value, FastTrackError::Cancelled { .. }))
                     {
                         self.db.mark_event(
                             event_id,
@@ -323,7 +323,7 @@ impl IngestEngine {
                             total_bytes,
                             false,
                         )?;
-                        return Err(MoonError::Cancelled {
+                        return Err(FastTrackError::Cancelled {
                             copied: verified_files as u32,
                             total: total_files as u32,
                         }
@@ -369,7 +369,7 @@ impl IngestEngine {
             manifest_records,
             locked,
         );
-        let manifest_path = preflight.destination_root.join(".mooningest_manifest.json");
+        let manifest_path = preflight.destination_root.join(".fasttrack_manifest.json");
         prepare_manifest_for_write(&manifest_path).with_context(|| {
             format!(
                 "Could not reopen manifest at '{}'.",
@@ -439,7 +439,7 @@ impl IngestEngine {
         enforce_path_limit(&destination_root)?;
 
         if !request.source_drive.exists() {
-            return Err(MoonError::NoMediaFound {
+            return Err(FastTrackError::NoMediaFound {
                 drive: request.source_drive.display().to_string(),
             }
             .into());
@@ -490,7 +490,7 @@ impl IngestEngine {
             }
         }
 
-        let probe = destination_root.join(".moon_write_probe.tmp");
+        let probe = destination_root.join(".fasttrack_write_probe.tmp");
         std::fs::write(&probe, b"probe").with_context(|| {
             format!(
                 "Destination '{}' is not writable.",
@@ -504,7 +504,7 @@ impl IngestEngine {
             .or_else(|_| available_space(&request.base_path))
             .unwrap_or_default();
         if available < required {
-            return Err(MoonError::DiskFull {
+            return Err(FastTrackError::DiskFull {
                 needed: required,
                 available,
             }
@@ -637,7 +637,7 @@ impl IngestEngine {
                     let _ = std::fs::remove_file(&self.paths.lock_file);
                 } else {
                     return Err(anyhow::anyhow!(
-                        "Another Moon Ingest session appears active (PID {}). Close it before starting a new ingest.",
+                        "Another FastTrack session appears active (PID {}). Close it before starting a new ingest.",
                         lock.pid
                     ));
                 }
@@ -812,14 +812,14 @@ where
         let mut source =
             File::open(&file.source_path)
                 .await
-                .map_err(|source| MoonError::SourceReadError {
+                .map_err(|source| FastTrackError::SourceReadError {
                     path: file.source_path.clone(),
                     source,
                 })?;
         let mut dest =
             File::create(destination)
                 .await
-                .map_err(|source| MoonError::DestWriteError {
+                .map_err(|source| FastTrackError::DestWriteError {
                     path: destination.to_path_buf(),
                     source,
                 })?;
@@ -831,7 +831,7 @@ where
 
         loop {
             if cancel_flag.load(Ordering::Relaxed) {
-                return Err(MoonError::Cancelled {
+                return Err(FastTrackError::Cancelled {
                     copied: 0,
                     total: 0,
                 }
@@ -841,7 +841,7 @@ where
                 source
                     .read(&mut buffer)
                     .await
-                    .map_err(|source| MoonError::SourceReadError {
+                    .map_err(|source| FastTrackError::SourceReadError {
                         path: file.source_path.clone(),
                         source,
                     })?;
@@ -851,7 +851,7 @@ where
             hasher.update(&buffer[..read]);
             dest.write_all(&buffer[..read])
                 .await
-                .map_err(|source| MoonError::DestWriteError {
+                .map_err(|source| FastTrackError::DestWriteError {
                     path: destination.to_path_buf(),
                     source,
                 })?;
@@ -883,7 +883,7 @@ where
         }
 
         last_error = Some(
-            MoonError::ChecksumMismatch {
+            FastTrackError::ChecksumMismatch {
                 filename: file.filename.clone(),
                 source_hash,
                 dest_hash,
@@ -972,7 +972,7 @@ mod tests {
     use tokio::runtime::Builder;
 
     use crate::app::db::Database;
-    use crate::app::errors::MoonError;
+    use crate::app::errors::FastTrackError;
     use crate::app::manifest::Manifest;
     use crate::app::scanner::scan_drive;
     use crate::app::settings::{AppPaths, Settings};
@@ -983,13 +983,13 @@ mod tests {
     use super::IngestEngine;
 
     fn test_paths(root: &Path) -> AppPaths {
-        let app_root = root.join("MoonIngest");
+        let app_root = root.join("FastTrack");
         AppPaths {
             root_dir: app_root.clone(),
             logs_dir: app_root.join("logs"),
             backups_dir: app_root.join("backups"),
             settings_file: app_root.join("settings.toml"),
-            db_file: app_root.join("moon_ingest.db"),
+            db_file: app_root.join("fasttrack.db"),
             lock_file: app_root.join(".lock"),
         }
     }
@@ -1074,7 +1074,7 @@ mod tests {
         let manifest_path = base
             .join("Client One")
             .join("Barat")
-            .join(".mooningest_manifest.json");
+            .join(".fasttrack_manifest.json");
         assert!(manifest_path.exists());
         let raw = fs::read_to_string(&manifest_path).expect("read manifest");
         let manifest: Manifest = serde_json::from_str(&raw).expect("parse manifest");
@@ -2075,8 +2075,8 @@ mod tests {
 
         let error = result.expect_err("expected cancellation");
         let cancelled = error
-            .downcast_ref::<MoonError>()
-            .is_some_and(|value| matches!(value, MoonError::Cancelled { .. }));
+            .downcast_ref::<FastTrackError>()
+            .is_some_and(|value| matches!(value, FastTrackError::Cancelled { .. }));
         assert!(cancelled, "expected cancel error, got {error:#}");
 
         let pending = db.pending_resumes().expect("pending resumes");

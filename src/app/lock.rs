@@ -28,9 +28,9 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_SYSTEM, FILE_DELETE_CHILD, FILE_FLAGS_AND_ATTRIBUTES,
 };
 
-use crate::app::errors::MoonError;
+use crate::app::errors::FastTrackError;
 
-pub fn apply_readonly_recursive(root: &Path) -> Vec<(PathBuf, MoonError)> {
+pub fn apply_readonly_recursive(root: &Path) -> Vec<(PathBuf, FastTrackError)> {
     let mut errors = Vec::new();
     let mut entries: Vec<PathBuf> = walkdir::WalkDir::new(root)
         .into_iter()
@@ -48,7 +48,7 @@ pub fn apply_readonly_recursive(root: &Path) -> Vec<(PathBuf, MoonError)> {
     errors
 }
 
-pub fn clear_readonly_recursive(root: &Path) -> Vec<(PathBuf, MoonError)> {
+pub fn clear_readonly_recursive(root: &Path) -> Vec<(PathBuf, FastTrackError)> {
     let mut errors = Vec::new();
     let mut entries: Vec<PathBuf> = walkdir::WalkDir::new(root)
         .into_iter()
@@ -66,14 +66,14 @@ pub fn clear_readonly_recursive(root: &Path) -> Vec<(PathBuf, MoonError)> {
     errors
 }
 
-fn set_readonly_state(path: &Path, readonly: bool) -> Result<(), MoonError> {
-    let metadata = fs::metadata(path).map_err(|source| MoonError::AttributeError {
+fn set_readonly_state(path: &Path, readonly: bool) -> Result<(), FastTrackError> {
+    let metadata = fs::metadata(path).map_err(|source| FastTrackError::AttributeError {
         path: path.to_path_buf(),
         source,
     })?;
     let mut permissions = metadata.permissions();
     permissions.set_readonly(readonly);
-    fs::set_permissions(path, permissions).map_err(|source| MoonError::AttributeError {
+    fs::set_permissions(path, permissions).map_err(|source| FastTrackError::AttributeError {
         path: path.to_path_buf(),
         source,
     })?;

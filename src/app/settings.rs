@@ -21,6 +21,18 @@ pub struct IngestSettings {
     pub separate_raw_jpg: bool,
     pub include_proxy_files: bool,
     pub skip_hidden_files: bool,
+    #[serde(default = "default_event_sequence")]
+    pub event_sequence: Vec<String>,
+}
+
+fn default_event_sequence() -> Vec<String> {
+    vec![
+        "Ubtan".to_string(),
+        "Mehndi".to_string(),
+        "Barat".to_string(),
+        "Walima".to_string(),
+        "Portraits".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +108,7 @@ impl Default for Settings {
                 separate_raw_jpg: true,
                 include_proxy_files: false,
                 skip_hidden_files: true,
+                event_sequence: default_event_sequence(),
             },
             safety: SafetySettings {
                 lock_mode: LockMode::Attribute,

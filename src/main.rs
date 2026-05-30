@@ -87,7 +87,7 @@ fn main() -> Result<()> {
             .to_string()
             .into(),
     );
-    let initial_event_options = db.event_options("").unwrap_or_default();
+    let initial_event_options = db.event_options("", &settings.ingest.event_sequence).unwrap_or_default();
     apply_event_menu(
         &window,
         &initial_event_options,
@@ -292,12 +292,12 @@ fn wire_scan(window: &AppWindow, state: AppState) {
                         .map(|ui| ui.get_client_name().to_string())
                         .unwrap_or_default();
                     let suggestion = if current_client.trim().is_empty() {
-                        next_event_suggestion(&[])
+                        next_event_suggestion(&[], &state.settings.ingest.event_sequence)
                     } else {
                         state
                             .db
-                            .suggest_next_event(current_client.trim())
-                            .unwrap_or_else(|_| next_event_suggestion(&[]))
+                            .suggest_next_event(current_client.trim(), &state.settings.ingest.event_sequence)
+                            .unwrap_or_else(|_| next_event_suggestion(&[], &state.settings.ingest.event_sequence))
                     };
                     if let Err(error) = set_current_scan(&state, Some(scan.clone())) {
                         state.operation_active.store(false, Ordering::Relaxed);
@@ -314,7 +314,7 @@ fn wire_scan(window: &AppWindow, state: AppState) {
                         .unwrap_or_default();
                     let event_options = state
                         .db
-                        .event_options(current_client.trim())
+                        .event_options(current_client.trim(), &state.settings.ingest.event_sequence)
                         .unwrap_or_default();
                     let resume_hint = state
                         .db
@@ -360,8 +360,8 @@ fn wire_scan(window: &AppWindow, state: AppState) {
                 }
                 Err(error) => {
                     let scan_cancelled = error
-                        .downcast_ref::<app::errors::MoonError>()
-                        .is_some_and(|value| matches!(value, app::errors::MoonError::ScanCancelled));
+                        .downcast_ref::<app::errors::FastTrackError>()
+                        .is_some_and(|value| matches!(value, app::errors::FastTrackError::ScanCancelled));
                     let error_text = format!("{error:#}");
                     let _ = weak.upgrade_in_event_loop(move |ui| {
                         if scan_cancelled {
@@ -658,12 +658,12 @@ fn wire_suggest_client(window: &AppWindow, state: AppState) {
             let text = format_client_suggestions(&clients, &selected_name);
             let event_options = state
                 .db
-                .event_options(selected_name.trim())
+                .event_options(selected_name.trim(), &state.settings.ingest.event_sequence)
                 .unwrap_or_default();
             let suggested_event = state
                 .db
-                .suggest_next_event(selected_name.trim())
-                .unwrap_or_else(|_| next_event_suggestion(&[]));
+                .suggest_next_event(selected_name.trim(), &state.settings.ingest.event_sequence)
+                .unwrap_or_else(|_| next_event_suggestion(&[], &state.settings.ingest.event_sequence));
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 ui.set_client_name(selected_name.into());
                 ui.set_base_path(selected_base.into());
@@ -709,12 +709,12 @@ fn wire_client_typing_suggestions(window: &AppWindow, state: AppState) {
             let report = format_client_suggestions(&clients, &selected_name);
             let event_options = state
                 .db
-                .event_options(selected_name.trim())
+                .event_options(selected_name.trim(), &state.settings.ingest.event_sequence)
                 .unwrap_or_default();
             let suggested_event = state
                 .db
-                .suggest_next_event(selected_name.trim())
-                .unwrap_or_else(|_| next_event_suggestion(&[]));
+                .suggest_next_event(selected_name.trim(), &state.settings.ingest.event_sequence)
+                .unwrap_or_else(|_| next_event_suggestion(&[], &state.settings.ingest.event_sequence));
             let typed_query = query.clone();
             let state_for_ui = state.clone();
 
@@ -756,14 +756,14 @@ fn wire_event_typing_suggestions(window: &AppWindow, state: AppState) {
                 return;
             }
 
-            let full_options = match state.db.event_options(client_name.trim()) {
+            let full_options = match state.db.event_options(client_name.trim(), &state.settings.ingest.event_sequence) {
                 Ok(options) => options,
                 Err(_) => return,
             };
             let options =
                 match state
                     .db
-                    .search_event_options(client_name.trim(), event_query.trim(), 8)
+                    .search_event_options(client_name.trim(), event_query.trim(), 8, &state.settings.ingest.event_sequence)
                 {
                     Ok(options) => options,
                     Err(_) => return,
@@ -780,8 +780,8 @@ fn wire_event_typing_suggestions(window: &AppWindow, state: AppState) {
 
             let suggested = state
                 .db
-                .suggest_next_event(client_name.trim())
-                .unwrap_or_else(|_| next_event_suggestion(&[]));
+                .suggest_next_event(client_name.trim(), &state.settings.ingest.event_sequence)
+                .unwrap_or_else(|_| next_event_suggestion(&[], &state.settings.ingest.event_sequence));
             let report = format_event_options(&menu_options, &suggested);
             let typed_query = event_query.clone();
             let state_for_ui = state.clone();
